@@ -1,0 +1,1 @@
+{"schema":1,"shards":{"issues/000000000000":{"count":2,"index":"index/issues/000000000000.json","kind":"issues","records":"records/issues/000000000000.json","revision":"db0783982ec34bfb"},"prs/000000000000":{"count":1,"index":"index/prs/000000000000.json","kind":"prs","records":"records/prs/000000000000.json","revision":"fcb7245cf51d52f7"}},"totals":{"issues":2,"prs":1}}
