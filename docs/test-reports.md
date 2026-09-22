@@ -15,3 +15,5 @@ Actions 产物名使用 `ut-results`、`st-results`、`e2e-results`（分片可�
 
 报告只关联当前 run、SHA 和 attempt；重跑前的产物不会挪用。过期、下载失败、解析失败和未上传均显示未知数量。每个产物最多下载 80 MiB，下载受整次读取时间预算约束；持续缓慢传输也会中止并标记不可读取，不阻断整站更新。展开内容最多 160 MiB / 3000 个条目，不解压到磁盘。公开历史只保留指标；原始详情在 GitHub 查看。
 
+
+测试站保留 `node-coverage-summary-*` / `python-coverage-summary-*` 产物的 Coverage 页。按摘要 `mode` / `authoritative` 区分完整结果和增量估算，展示分语言趋势、路径及 PR 指标。

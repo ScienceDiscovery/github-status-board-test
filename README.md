@@ -20,6 +20,8 @@ python3 server.py
 
 此兼容命令生成有限近期快照；完整历史由 `--incremental` 模式基于目标仓自己的 `.sync/` 续跑。两种模式不要同时写同一站点。
 
+测试站另保留 Coverage 页：Node.js / Python 完整运行趋势、路径指标及最近 PR 覆盖率；main 增量合成值明确标记为估算。
+
 ## 文档
 
 [文档目录](docs/README.md) · [增量同步与历史](docs/incremental-history.md) · [Actions 配置](docs/actions-collection.md) · [测试报告契约](docs/test-reports.md)
