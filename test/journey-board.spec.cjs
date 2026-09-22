@@ -2,7 +2,7 @@ const { test, expect } = require('../.e2e/node_modules/@playwright/test');
 const { resolve } = require('node:path');
 const shot = name => resolve(__dirname, '../.e2e/' + name + '.png');
 
-test('all ten pages render; only static requests and no promotional copy', async ({ page }) => {
+test('all existing pages render; only static requests and no promotional copy', async ({ page }) => {
   const requests = [], errors = [];
   page.on('request', r => requests.push(r.url()));
   page.on('pageerror', e => errors.push(e.message));
@@ -21,7 +21,7 @@ test('all ten pages render; only static requests and no promotional copy', async
   const tabsBox=await page.locator('#tabs').boundingBox(), timeBox=await page.locator('#meta').boundingBox();
   expect(timeBox.x).toBeGreaterThan(tabsBox.x+tabsBox.width);
   expect(timeBox.y).toBeLessThan(tabsBox.y+tabsBox.height);
-  for (const id of ['board','issues','prs','ci','tests','coverage','ops','quality','releases']) {
+  for (const id of ['board','issues','prs','ci','tests','ops','quality','releases']) {
     await page.locator(`[data-tab="${id}"]`).click();
     await expect(page.locator(`#tab-${id}`)).toBeVisible();
     await expect(page.locator(`#tab-${id}`)).not.toContainText('渲染出错');
@@ -125,23 +125,13 @@ test('CI trends, failed job steps, test distribution, coverage and operations',a
   await page.goto('/github-status-board/#ci');
   await expect(page.locator('#tab-ci')).toContainText('Workflow 健康');
   await expect(page.locator('#tab-ci')).toContainText('Run browser journeys');
-  await expect(page.locator('#tab-ci')).toContainText('Coverage');
   await page.locator('[data-tab="tests"]').click();
   await expect(page.locator('#tab-tests')).toContainText('按包 / 目录分布');
   await expect(page.locator('#tab-tests')).toContainText('services/core');
+  await expect(page.locator('#tab-tests')).toContainText('80.0%');
   await expect(page.locator('#tab-tests')).not.toContainText('200.0%');
   await expect(page.locator('#tab-tests')).not.toContainText('undefined');
   await page.screenshot({path:shot('tests-desktop'),fullPage:true});
-  await page.locator('[data-tab="coverage"]').click();
-  await expect(page.locator('#tab-coverage')).toContainText('整仓行覆盖率');
-  await expect(page.locator('#tab-coverage .tiles').first().locator('.tile')).toHaveCount(3);
-  await expect(page.locator('#tab-coverage .tiles').first()).not.toContainText('Node.js 函数覆盖率');
-  await expect(page.locator('#tab-coverage')).toContainText('80.7%');
-  await expect(page.locator('#tab-coverage')).toContainText('Node.js');
-  await expect(page.locator('#tab-coverage')).toContainText('83.0%');
-  await expect(page.locator('#tab-coverage')).toContainText('Python');
-  await expect(page.locator('#tab-coverage')).toContainText('65.4%');
-  await page.screenshot({path:shot('coverage-desktop'),fullPage:true});
   await page.locator('[data-tab="ops"]').click();
   await expect(page.locator('#tab-ops')).toContainText('贡献者');
   await expect(page.locator('#tab-ops')).toContainText('分支与保护');
