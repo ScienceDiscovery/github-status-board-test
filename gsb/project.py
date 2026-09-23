@@ -8,6 +8,8 @@ import re
 import zipfile
 from urllib.parse import quote
 
+from .ci_lanes import build_lanes
+from .tagged import TaggedStore
 from .collectors import Context, collect_issues, collect_prs
 from .config import Config
 from .github import GitHubError
@@ -33,7 +35,10 @@ def slim_run(run, rules):
             "conclusion": run.get("conclusion"), "branch": run.get("head_branch"), "sha": run.get("head_sha"),
             "attempt": run.get("run_attempt", 1), "created_at": run.get("created_at"),
             "started_at": run.get("run_started_at"), "updated_at": run.get("updated_at"), "url": run.get("html_url"),
-            "pull_requests": [p["number"] for p in run.get("pull_requests", [])], "tests": [], "jobs": [],
+            "pull_requests": [p["number"] for p in run.get("pull_requests", [])],
+            # Fork PR runs carry no pull_requests; the head repository lets the
+            # CI lanes match them to the right PR.
+            "head_repo": (run.get("head_repository") or {}).get("full_name"), "tests": [], "jobs": [],
             "reports_status": "not_inspected"}
 
 
@@ -81,6 +86,8 @@ def run_details(gh, cfg, run, *, cache=None, parser_version=None):
                     raise ValueError("artifact over budget")
                 parsed = parse_report_zip(gh.download_artifact(cfg.repo, artifact["id"], max_bytes=cfg.artifact_max_bytes))
                 if parsed:
+                    # Frozen test catalogs are large; callers move them out of the run record.
+                    run.setdefault("tagged", []).extend(parsed.get("tagged") or [])
                     for coverage in parsed.get("coverage", []):
                         run.setdefault("coverage", []).append({**coverage, "artifact": name, "run_id": run["id"], "sha": run["sha"], "attempt": run["attempt"], "url": run["url"]})
                     if parsed.get("tests") is None:
@@ -133,6 +140,7 @@ def build_project(gh, repo, settings=None):
             except GitHubError:
                 doc["notices"].append({"section": section, "message": "GitHub 数据读取失败；未将缺失数据计为零。"})
     rules = settings.get("workflows", {})
+    tagged = TaggedStore()
     try:
         raw_runs = gh.get(f"/repos/{repo}/actions/runs", {"per_page": 100}).get("workflow_runs", [])
         runs = sorted([slim_run(r, rules) for r in raw_runs], key=lambda r: r.get("created_at") or "", reverse=True)
@@ -148,6 +156,8 @@ def build_project(gh, repo, settings=None):
         selected = (selected + [r for r in runs if r not in selected])[:12]
         with ThreadPoolExecutor(max_workers=3) as pool:
             list(pool.map(lambda r: run_details(gh, cfg, r), selected))
+        for run in runs:
+            tagged.observe(run, run.pop("tagged", None) or [], meta["default_branch"])
         doc["quality"]["runs"] = runs
         doc["quality"]["status"] = "available"
     except GitHubError:
@@ -181,6 +191,21 @@ def build_project(gh, repo, settings=None):
     # Never accidentally include the collector credential in public output.
     from .public_sections import extend_project
     extend_project(doc, context)
+    ci = doc["sections"]["ci"].get("data")
+    if ci is not None:
+        runs = doc["quality"]["runs"]
+        # This export reads a single page of runs; earlier days are marked uncollected.
+        ci["lanes"] = build_lanes(runs, default_branch=meta["default_branch"], now=now, rules=rules,
+                                  prs=[pr for key in ("items", "recent_merged", "recent_closed_unmerged") for pr in (doc["prs"] or {}).get(key, [])],
+                                  collected_since=runs[-1]["created_at"] if len(runs) >= 100 else None)
+    try:
+        # The vocabulary only fills defaults; an unreadable copy must not hide Actions data.
+        tagged.refresh_schema(gh.get_text_file, repo)
+    except GitHubError:
+        pass
+    tests = doc["sections"]["tests"].get("data")
+    if isinstance(tests, dict):
+        tests["tagged"] = tagged.view()
     if gh.token and gh.token in json.dumps(doc, ensure_ascii=False):
         raise ValueError("credential detected in export")
     return doc

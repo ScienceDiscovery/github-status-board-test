@@ -13,7 +13,7 @@ from gsb.github import GitHub, GitHubError, discover_token
 from gsb.project import REPO_RE, build_project
 
 ROOT = Path(__file__).resolve().parent
-STATIC_FILES = ("index.html", "app.js", "style.css", "report.js", "board.js", "board-local.js", "history.js")
+STATIC_FILES = ("index.html", "app.js", "style.css", "board.js", "board-local.js")
 
 
 def deployment_for(repo, settings, target=None):
@@ -73,7 +73,7 @@ def publish_batch(gh, repository, branch, base, files, *, source_token=None):
     if gh.get(prefix + "/git/ref/heads/" + branch)["object"]["sha"] != base:
         raise ValueError("publication conflict; retry from latest checkout")
     for path, content in files.items():
-        allowed = path in {"site/" + x for x in (*STATIC_FILES, "data/snapshot.json", ".nojekyll")} or path in {".sync/state.json", ".sync/aggregate.json", ".sync/supplements.json"} or re.fullmatch(r"site/data/history/(manifest\.json|(?:index|records|catalog)/(?:issues|prs|runs|releases)/[0-9]{12}\.json)", path)
+        allowed = path in {"site/" + x for x in (*STATIC_FILES, "data/snapshot.json", ".nojekyll")} or path in {".sync/state.json", ".sync/aggregate.json", ".sync/supplements.json", ".sync/tagged.json"} or re.fullmatch(r"site/data/history/(manifest\.json|(?:index|records|catalog)/(?:issues|prs|runs|releases)/[0-9]{12}\.json)", path)
         if not allowed or any(t and t in content for t in (gh.token, source_token)):
             raise ValueError("unsafe public file")
     if not files:

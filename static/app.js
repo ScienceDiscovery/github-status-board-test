@@ -31,6 +31,15 @@
     return `${Math.floor(diff / 86400 / 30)} 个月前`;
   };
   const date = (iso) => (iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '—');
+  const shortDate = (iso) => {
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? '—' : `${d.getMonth() + 1}/${d.getDate()}`;
+  };
+  const shortDateTime = (iso) => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '—';
+    return `${shortDate(iso)} ${[d.getHours(), d.getMinutes(), d.getSeconds()].map((value) => String(value).padStart(2, '0')).join(':')}`;
+  };
   const days = (d) => (d == null ? '—' : d < 1 ? '<1 天' : `${Math.round(d)} 天`);
   const tip = (text) => ` data-tip="${esc(text)}"`;
   const link = (href, text, extra = '') => `<a href="${esc(/^https:\/\//.test(href || "") ? href : "#")}" target="_blank" rel="noopener"${extra}>${text}</a>`;
@@ -39,7 +48,9 @@
   const CONCLUSION_TONE = { success: 'good', failure: 'bad', timed_out: 'bad', cancelled: '', skipped: '', in_progress: 'warn', queued: 'warn', pending: 'warn', neutral: '', action_required: 'warn', startup_failure: 'bad', error: 'bad', expected: 'warn' };
   const CONCLUSION_NAME = { success: '成功', failure: '失败', timed_out: '超时', cancelled: '取消', skipped: '跳过', in_progress: '运行中', queued: '排队', pending: '等待', neutral: '中性', action_required: '需处理', startup_failure: '启动失败', error: '错误', expected: '等待' };
 
-  const STATE = { snap: null, status: null, tab: 'overview', sort: {}, filters: { issueQ: '', issueLabel: '', issueAssignee: '', runBranch: '' }, pollTimer: null };
+  const VIEW_KEY = 'gsb.list.view';
+  const loadViews = () => { try { return { issues: 'table', prs: 'table', ...JSON.parse(localStorage.getItem(VIEW_KEY) || '{}') }; } catch (e) { return { issues: 'table', prs: 'table' }; } };
+  const STATE = { snap: null, status: null, tab: 'overview', views: loadViews(), covOpen: new Set(), sort: {}, filters: { issueQ: '', issueLabel: '', issueAssignee: '', runBranch: '' }, coverageWeekOffset: 0, pollTimer: null };
 
   // ------------------------------------------------------------ components
   const badge = (text, tone = '', extra = '') => `<span class="badge ${tone}"${extra}>${esc(text)}</span>`;
@@ -81,7 +92,175 @@
     const dots = pts.map((p, i) => `<rect x="${(p[0] - 6).toFixed(1)}" y="0" width="12" height="${h}" fill="transparent"${tip(`${labels[i] || ''}: ${values[i]} ${unit}`)}></rect>`).join('');
     return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path class="area" d="${area}"></path><line class="base" x1="${pad}" y1="${h - pad}" x2="${w - pad}" y2="${h - pad}"></line><path d="${path}"></path><circle cx="${last[0]}" cy="${last[1]}" r="3"></circle>${dots}</svg>`;
   };
-  const strip = (runs) => `<div class="strip">${runs.slice().reverse().map((r) => `<a class="${esc(r.conclusion || r.status)}" href="${esc(r.url)}" target="_blank" rel="noopener"${tip(`${r.title || r.name}\n${CONCLUSION_NAME[r.conclusion] || r.status} · ${r.branch} · ${r.event}\n${date(r.created_at)} · ${dur(r.duration_s)}`)}></a>`).join('')}</div>`;
+  const dayDate = (day) => new Date(`${day}T00:00:00Z`);
+  const dayString = (value) => {
+    const d = value instanceof Date ? value : dayDate(value);
+    return d.toISOString().slice(0, 10);
+  };
+  const addDays = (day, count) => {
+    const d = dayDate(day);
+    d.setUTCDate(d.getUTCDate() + count);
+    return dayString(d);
+  };
+  const weekStart = (day) => {
+    const d = dayDate(day);
+    const offset = (d.getUTCDay() + 6) % 7;
+    return addDays(day, -offset);
+  };
+  const dayLabel = (day) => {
+    const d = dayDate(day);
+    return `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+  };
+  const coverageRange = (languages) => {
+    const days = Object.values(languages).flatMap((dataset) => (dataset.history || []).map((row) => row.day).filter(Boolean)).sort();
+    if (!days.length) return null;
+    const latestDay = days[days.length - 1];
+    const earliest = weekStart(days[0]);
+    const firstHistoryWeek = addDays(weekStart(latestDay), -7);
+    const maxOffset = dayDate(firstHistoryWeek) < dayDate(earliest)
+      ? 0
+      : Math.floor((dayDate(firstHistoryWeek) - dayDate(earliest)) / 604800000) + 1;
+    STATE.coverageWeekOffset = Math.max(0, Math.min(STATE.coverageWeekOffset, maxOffset));
+    if (STATE.coverageWeekOffset === 0) {
+      return { start: addDays(latestDay, -6), end: latestDay, maxOffset, recent: true };
+    }
+    const start = addDays(firstHistoryWeek, -7 * (STATE.coverageWeekOffset - 1));
+    return { start, end: addDays(start, 6), maxOffset, recent: false };
+  };
+  const coverageTrend = (history, selectedWeek) => {
+    if (!selectedWeek) return '';
+    const w = 800, h = 210, left = 58, right = 18, top = 12, bottom = 34;
+    const plotW = w - left - right, plotH = h - top - bottom;
+    const byDay = new Map(history.filter((row) => row.day).map((row) => [row.day, row]));
+    const slots = Array.from({ length: 7 }, (_, index) => {
+      const day = addDays(selectedWeek, index);
+      return { day, row: byDay.get(day) || null };
+    });
+    const values = slots.filter((slot) => slot.row?.totals?.lines?.percentage != null)
+      .map((slot) => Number(slot.row.totals.lines.percentage));
+    if (!values.length) {
+      return `<div class="coverage-week-empty">${slots.map((slot) => `<span>${dayLabel(slot.day)}</span>`).join('')}<strong>该周没有成功的完整覆盖率结果</strong></div>`;
+    }
+    const rawMin = Math.min(...values), rawMax = Math.max(...values);
+    const margin = Math.max((rawMax - rawMin) * 0.18, 0.5);
+    const paddedMin = Math.max(0, rawMin - margin), paddedMax = Math.min(100, rawMax + margin);
+    const roughStep = Math.max((paddedMax - paddedMin) / 4, 0.1);
+    const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+    const fraction = roughStep / magnitude;
+    const tickStep = (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * magnitude;
+    const yMin = Math.max(0, Math.floor(paddedMin / tickStep) * tickStep);
+    const yMax = Math.min(100, Math.ceil(paddedMax / tickStep) * tickStep);
+    const yRange = yMax - yMin || 1;
+    const pts = slots.map((slot, index) => {
+      if (!slot.row) return null;
+      const value = Number(slot.row.totals.lines.percentage);
+      return {
+        x: left + (index * plotW) / 6,
+        y: top + ((yMax - value) / yRange) * plotH,
+        value,
+        row: slot.row,
+        day: slot.day,
+      };
+    });
+    const segments = [];
+    for (const point of pts) {
+      if (!point) {
+        if (segments.length && segments[segments.length - 1].length) segments.push([]);
+        continue;
+      }
+      if (!segments.length) segments.push([]);
+      segments[segments.length - 1].push(point);
+    }
+    const populated = segments.filter((segment) => segment.length);
+    const paths = populated.map((segment) => segment.map((point, index) => `${index ? 'L' : 'M'}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' '));
+    const baseY = top + plotH;
+    const areas = populated.filter((segment) => segment.length > 1).map((segment) => {
+      const path = segment.map((point, index) => `${index ? 'L' : 'M'}${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
+      return `${path} L${segment[segment.length - 1].x.toFixed(1)},${baseY} L${segment[0].x.toFixed(1)},${baseY} Z`;
+    });
+    const ticks = Array.from({ length: Math.round((yMax - yMin) / tickStep) + 1 }, (_, index) => yMin + tickStep * index);
+    const yAxis = ticks.map((value) => {
+      const y = top + ((yMax - value) / yRange) * plotH;
+      const label = tickStep < 1 ? value.toFixed(1) : value.toFixed(0);
+      return `<line class="coverage-grid" x1="${left}" y1="${y.toFixed(1)}" x2="${w - right}" y2="${y.toFixed(1)}"></line><text class="coverage-y-label" x="${left - 9}" y="${(y + 4).toFixed(1)}" text-anchor="end">${label}%</text>`;
+    }).join('');
+    const xAxis = slots.map((slot, index) => {
+      const x = left + (index * plotW) / 6;
+      const anchor = index === 0 ? 'start' : index === 6 ? 'end' : 'middle';
+      return `<text class="coverage-x-label" x="${x.toFixed(1)}" y="${h - 8}" text-anchor="${anchor}">${dayLabel(slot.day)}</text>`;
+    }).join('');
+    const dots = pts.filter(Boolean).map((point) => {
+      const label = `${date(point.row.created_at)} · ${pct(point.value)}\n${point.row.kind === 'nightly' ? 'nightly' : 'main push'} · ${(point.row.sha || '').slice(0, 12)}\n${point.row.artifact || ''}`;
+      return `<circle class="coverage-dot" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="4"></circle><circle class="coverage-hit" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="11"${tip(label)}></circle>`;
+    }).join('');
+    return `<svg class="coverage-trend" viewBox="0 0 ${w} ${h}" role="img" aria-label="完整行覆盖率历史趋势">${yAxis}<line class="coverage-axis" x1="${left}" y1="${top}" x2="${left}" y2="${baseY}"></line><line class="coverage-axis" x1="${left}" y1="${baseY}" x2="${w - right}" y2="${baseY}"></line>${areas.map((area) => `<path class="coverage-area" d="${area}"></path>`).join('')}${paths.map((path) => `<path class="coverage-line" d="${path}"></path>`).join('')}${dots}${xAxis}</svg>`;
+  };
+  // CI history lanes: one row per trigger lane, one column per day on a shared axis.
+  // The collector buckets days and orders runs, so a column simply stacks them top-down.
+  const LANE_SOURCE = { pr: 'CI · pull_request', main: 'CI · 默认分支 push / 手动', daily: 'Nightly · 定时 / 手动', release: 'Release · 版本 tag' };
+  const LANE_OUTCOMES = [['success', '成功'], ['failure', '失败/超时'], ['cancelled', '取消'], ['running', '运行中'], ['other', '其他（待批准等）']];
+  const LANE_EVENT = { schedule: 'schedule · 定时', workflow_dispatch: 'workflow_dispatch · 手动' };
+  const LANE_STACK = 10; // runs visible per day before that column scrolls
+  const laneDay = (iso) => { const [, m, d] = iso.split('-').map(Number); return `${m}/${d}`; };
+  const laneRun = (lane, day, r, zone) => {
+    const pr = r.pr ? ` · PR #${r.pr}${r.pr_linked ? '' : '（按分支推断）'}` : '';
+    const text = [
+      `${r.workflow} · ${LANE_EVENT[r.event] || r.event || '未知事件'}${pr}`,
+      `${CONCLUSION_NAME[r.conclusion] || CONCLUSION_NAME[r.status] || r.conclusion || r.status || '未知'}${r.attempt > 1 ? ` · 第 ${r.attempt} 次尝试` : ''}`,
+      `${laneDay(day)} ${r.time}（${zone}）`,
+      `${lane === 'release' ? '标签' : '分支'} ${r.branch || '—'}${r.sha ? ` · ${r.sha}` : ''}`,
+      r.title,
+    ].filter(Boolean).join('\n');
+    const href = /^https:\/\//.test(r.url || '') ? r.url : '#';
+    return `<a class="ci-run ${esc(r.outcome)}" href="${esc(href)}" target="_blank" rel="noopener" aria-label="${esc(text)}"${tip(text)}></a>`;
+  };
+  const ciLanes = (L, { notes: withNotes = true } = {}) => {
+    if (!L) return empty('分层历史会在下一次采集后出现');
+    const zone = L.zone || 'UTC+8';
+    const uncollected = (day) => L.collected_since && day < L.collected_since;
+    const outcomes = (runs) => LANE_OUTCOMES.map(([key, name]) => [name, runs.filter((r) => r.outcome === key).length]).filter(([, count]) => count).map(([name, count]) => `${name} ${count}`).join(' · ');
+    const rows = L.lanes.map((lane) => {
+      const s = lane.summary;
+      const counts = [['成功', s.success], ['失败', s.failure], ['取消', s.cancelled], ['运行中', s.running], ...(s.other ? [['其他', s.other]] : [])];
+      const head = `<div class="ci-lane-head" role="rowheader"><b>${esc(lane.label)}</b><span class="ci-lane-src">${esc(LANE_SOURCE[lane.key] || '')}</span>`
+        + `<span class="ci-lane-rate">成功率 ${pct(s.success_rate)}</span>`
+        + `<span class="ci-lane-sum">${s.total ? counts.map(([name, count]) => `<span>${name} ${count}</span>`).join(' · ') : '窗口内没有 run'}</span></div>`;
+      const days = lane.days.map((runs, i) => {
+        const day = L.days[i];
+        if (uncollected(day)) return `<div class="ci-lane-day uncollected" role="cell"${tip(`${laneDay(day)} 未采集`)}></div>`;
+        const more = runs.length > LANE_STACK ? `<span class="ci-day-more">${runs.length}</span>` : '';
+        const note = runs.length ? tip(`${laneDay(day)} · ${lane.label} ${runs.length} 次\n${outcomes(runs)}`) : '';
+        return `<div class="ci-lane-day${more ? ' dense' : ''}" role="cell"${note}><div class="ci-day-stack">${runs.map((r) => laneRun(lane.key, day, r, zone)).join('')}</div>${more}</div>`;
+      }).join('');
+      return `<div class="ci-lane-row" role="row" data-lane="${esc(lane.key)}">${head}${days}</div>`;
+    }).join('');
+    const axis = L.days.map((day, i) => `<div class="ci-axis-day" role="columnheader">${i === 0 || day.endsWith('-01') ? laneDay(day) : Number(day.slice(8))}</div>`).join('');
+    const ex = L.excluded || {};
+    const notes = [
+      '成功率 = 成功 ÷（成功 + 失败/超时），取消、运行中与其他不计入；重跑按最后一次尝试着色，仍放在 run 创建的那天。',
+      'Nightly / Release 通过 workflow_call 调用的 CI 不单独成点，只计入调用方所在的 Daily / 版本层。',
+      ex.other ? `另有 ${ex.other} 次 run 不属于这四层（其他工作流或非默认分支 push），未画入。` : '',
+      ex.called ? `${ex.called} 次由其他工作流调用的 CI 子 run 已并入调用方。` : '',
+      ex.unknown ? `${ex.unknown} 次 run 缺少触发事件，无法分层。` : '',
+      L.collected_since ? `${laneDay(L.collected_since)} 之前的日期尚未采集（斜纹），不代表没有运行。` : '',
+    ].filter(Boolean);
+    const legendItems = LANE_OUTCOMES.map(([key, name]) => `<span><i class="ci-run ${key}"></i>${esc(name)}</span>`).join('') + (L.collected_since ? '<span><i class="ci-lane-day uncollected"></i>未采集</span>' : '');
+    return `<div class="ci-lanes-scroll"><div class="ci-lanes" role="table" aria-label="CI 分层历史" style="--days:${L.days.length}">${rows}<div class="ci-lane-row ci-axis" role="row"><div class="ci-lane-head" role="rowheader"></div>${axis}</div></div></div>`
+      + `<div class="legend ci-legend">${legendItems}</div>${withNotes ? `<ul class="notes ci-lane-notes">${notes.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}`;
+  };
+  // Narrow screens scroll the day axis. Stay on the newest day unless the reader scrolled away.
+  const pinLanes = (keep = {}) => document.querySelectorAll('.ci-lanes-scroll').forEach((el) => {
+    if (!el.clientWidth) return;
+    const saved = keep[el.closest('.tab')?.id];
+    if (saved != null) { el.scrollLeft = saved; el.dataset.away = '1'; } else if (!el.dataset.away) el.scrollLeft = el.scrollWidth;
+  });
+  // Charts the reader scrolled away from the newest day, by tab, so a refresh keeps their place.
+  const lanePositions = () => Object.fromEntries([...document.querySelectorAll('.ci-lanes-scroll')].filter((el) => el.dataset.away).map((el) => [el.closest('.tab')?.id, el.scrollLeft]));
+  // The Issue / PR list in board form renders through board.js into the page's mount point.
+  const mountBoard = () => {
+    const scope = { issues: 'issue', prs: 'pr' }[STATE.tab];
+    if (scope && STATE.views[STATE.tab] === 'board') { try { window.GSBBoard?.mount(scope); } catch (err) { console.error(err); } }
+  };
   const labelChips = (labels) => labels.map((l) => `<span class="label-chip"><span class="sw" style="background:#${esc(l.color || '999')}"></span>${esc(l.name)}</span>`).join('');
 
   /** Sortable table. cols: [{key,label,num,render,sort}] ; rows: objects. Sorting is client-side by id. */
@@ -121,54 +300,116 @@
   };
 
   // ------------------------------------------------------------ renderers
+  // Issue and PR lists switch between the table and the local board; the choice stays in this browser.
+  const viewSwitch = (tab) => `<div class="seg view-switch" data-work-view="${tab}" role="group" aria-label="列表形式">${[['table', '表格'], ['board', '看板']].map(([v, l]) => `<button type="button" class="${STATE.views[tab] === v ? 'on' : ''}" data-val="${v}" aria-pressed="${STATE.views[tab] === v}">${l}</button>`).join('')}</div>`;
+  const listHead = (tab, title, sub) => `<div class="section-head list-head"><h2>${esc(title)}</h2><span class="sub">${sub}</span><span class="grow"></span>${viewSwitch(tab)}</div>`;
+  const boardMount = (scope) => `<div class="work-board" data-scope="${scope}"><div class="skeleton"><span class="spinner"></span>装配看板…</div></div>`;
+  // Totals across test reports, or null when any report has no readable counts.
+  const sumCounts = (reports) => (!reports.length || reports.some((r) => !r.counts) ? null
+    : Object.fromEntries(['tests', 'passed', 'failed', 'skipped', 'flaky'].map((k) => [k, reports.reduce((sum, r) => sum + (r.counts[k] || 0), 0)])));
+  // Latest run of one CI lane, from the lane chart the collector already built.
+  const latestInLane = (lane) => {
+    for (let i = (lane?.days || []).length - 1; i >= 0; i--) if (lane.days[i].length) return lane.days[i][lane.days[i].length - 1];
+    return null;
+  };
+  const OUTCOME_TEXT = { success: ['成功', 'good'], failure: ['失败', 'bad'], cancelled: ['已取消', ''], running: ['运行中', 'warn'], other: ['待处理', 'warn'] };
+  // The newest `count` days of the lane chart, with each lane's summary recomputed for that window.
+  const recentLanes = (L, count) => L && ({ ...L, days: L.days.slice(-count), collected_since: L.collected_since && L.collected_since > L.days[L.days.length - count] ? L.collected_since : null,
+    excluded: {}, lanes: L.lanes.map((lane) => {
+      const days = lane.days.slice(-count), runs = days.flat(), by = (o) => runs.filter((r) => r.outcome === o).length;
+      const success = by('success'), failure = by('failure');
+      return { ...lane, days, summary: { total: runs.length, success, failure, cancelled: by('cancelled'), running: by('running'), other: by('other'), success_rate: success + failure ? Math.round((success * 1000) / (success + failure)) / 10 : null } };
+    }) });
+
   function renderOverview(snap) {
     const S = snap.sections;
-    const repo = S.repo?.data, iss = S.issues?.data, prs = S.prs?.data, ci = S.ci?.data, tests = S.tests?.data, ops = S.ops?.data;
-    const ut = tests?.executed?.find((e) => e.layer === 'ut' || e.artifact.startsWith('ut'));
-    const e2e = tests?.executed?.find((e) => e.layer === 'e2e');
-    const mainRate = ci?.main?.success_rate;
-    const cov = tests?.coverage;
-    const rel = ops?.releases?.latest;
-    let html = window.GSBQuality?.summary() || '';
-    html += repo ? `<div class="muted" style="margin-bottom:10px">${esc(repo.description || '')} · ⭐ ${n(repo.stars)} · fork ${n(repo.forks)} · ${esc(repo.language || '')} · ${esc(repo.license || '无 license')} · 默认分支 <code>${esc(repo.default_branch)}</code> · 最近 push ${ago(repo.pushed_at)}</div>` : '';
+    const iss = S.issues?.data, prs = S.prs?.data, ci = S.ci?.data, tests = S.tests?.data, ops = S.ops?.data;
+    const L = ci?.lanes, lanes = Object.fromEntries((L?.lanes || []).map((lane) => [lane.key, lane]));
+    const tagged = tests?.tagged, gate = tagged?.profiles?.find((p) => p.name === 'pr');
+    const cov = tests?.coverage, lines = cov?.current?.totals?.lines?.percentage ?? cov?.value?.lines_pct;
+    const releases = snap.releases || [], runsById = new Map((snap.quality?.runs || []).map((r) => [r.id, r]));
+    const validation = (release) => (release.validation_run_ids || []).map((id) => runsById.get(id)).filter(Boolean)[0] || null;
+    const hoursSince = (iso) => (iso ? (Date.now() - new Date(iso).getTime()) / 3600000 : Infinity);
+
+    // Problems first, most severe first: what a maintainer has to act on today.
+    const items = [];
+    const main = latestInLane(lanes.main), daily = latestInLane(lanes.daily), prGate = latestInLane(lanes.pr);
+    const runLink = (r) => (r ? ` ${link(r.url, '查看运行')}` : '');
+    // Unreadable data is unknown, never healthy.
+    [[ci, 'CI', '#ci'], [prs, 'PR', '#prs'], [iss, 'Issue', '#issues']].forEach(([value, name, href]) => { if (!value) items.push(['warn', `${name} 数据暂不可读取，状态未知`, href]); });
+    if (ci?.red_streak_main) items.push(['critical', `主干 CI 连续失败 ${ci.red_streak_main} 次；失败 job：${esc((ci.latest_main?.jobs || []).filter((j) => j.conclusion === 'failure').map((j) => j.name).join('、') || '—')}`, '#ci']);
+    else if (main?.outcome === 'failure') items.push(['critical', `主干最近一次 CI 失败（${esc(main.time)}，<code>${esc(main.sha)}</code>）${runLink(main)}`, '#ci']);
+    if (daily?.outcome === 'failure') items.push(['critical', `每日构建最近一次失败（${shortDate(daily.created_at)} ${esc(daily.time)}）${runLink(daily)}`, '#ci']);
+    else if (lanes.daily && hoursSince(daily?.created_at) > 36) items.push(['warn', daily ? `每日构建已 ${Math.floor(hoursSince(daily.created_at))} 小时没有运行` : '近 30 天没有每日构建运行', '#ci']);
+    const latestRelease = releases[0], releaseRun = latestRelease && validation(latestRelease);
+    if (latestRelease && !releaseRun) items.push(['warn', `版本 ${esc(latestRelease.tag)} 没有找到提交一致的版本验证运行`, '#releases']);
+    else if (releaseRun && releaseRun.status === 'completed' && releaseRun.conclusion !== 'success') items.push(['critical', `版本 ${esc(latestRelease.tag)} 的验证运行${esc(CONCLUSION_NAME[releaseRun.conclusion] || releaseRun.conclusion)}${runLink(releaseRun)}`, '#releases']);
+    if (prs?.ci_states?.failure) items.push(['warn', `${prs.ci_states.failure} 个开放 PR 的检查失败：${prs.items.filter((p) => p.ci?.state === 'failure').map((p) => link(p.url, `#${p.number}`)).join(' ')}`, '#prs']);
+    if (prs?.waiting_review_count) items.push(['warn', `${prs.waiting_review_count} 个 PR 超过 ${prs.review_sla_days} 天无人评审：${prs.items.filter((p) => p.waiting_review).map((p) => link(p.url, `#${p.number}`)).join(' ')}`, '#prs']);
+    if (prs?.items?.some((p) => p.mergeable === 'CONFLICTING')) items.push(['warn', `存在冲突的 PR：${prs.items.filter((p) => p.mergeable === 'CONFLICTING').map((p) => link(p.url, `#${p.number}`)).join(' ')}`, '#prs']);
+    const hints = [];
+    if (tagged?.uncovered?.cases) hints.push(['info', `${n(tagged.uncovered.cases)} 个标签化用例不会被任何流水线组合选中`, '#tests']);
+    if (iss?.no_response_count) hints.push(['info', `${iss.no_response_count} 个开放 Issue 还没有评论，${iss.unassigned_count} 个无人认领`, '#issues']);
+    if (iss?.stale_count) hints.push(['info', `${iss.stale_count} 个 Issue 超过 ${iss.stale_days_threshold} 天没有更新`, '#issues']);
+    if (ops?.releases?.unreleased?.commits > 50) hints.push(['info', `自 ${esc(ops.releases.latest?.tag)} 以来已有 ${n(ops.releases.unreleased.commits)} 个提交未发布`, '#releases']);
+    if (ops?.branches?.protection && !ops.branches.protection.enabled) hints.push(['info', `默认分支 ${esc(ops.branches.default)} 未启用分支保护`, '#ops']);
+    const line = ([sev, text, href]) => `<li><span class="sev ${sev}"></span><span>${text} <a href="${href}">详情</a></span></li>`;
+    const serious = items.filter(([sev]) => sev === 'critical').length;
+    let html = `<div class="card health ${serious ? 'health-bad' : items.length ? 'health-warn' : 'health-good'}"><h3>${serious ? `${serious} 个流水线问题需要处理` : items.length ? `${items.length} 项需要关注` : '流水线与交付状态正常'}<span class="sub">数据截至 ${date(snap.generated_at)}（${ago(snap.generated_at)}）</span></h3>
+      ${items.length ? `<ul class="attention">${items.map(line).join('')}</ul>` : '<div class="muted">主干、每日构建和最新版本都没有失败；开放 PR 没有失败检查或超期评审。</div>'}
+      ${hints.length ? `<details class="hints"><summary>其他提示（${hints.length}）</summary><ul class="attention">${hints.map(line).join('')}</ul></details>` : ''}</div>`;
+
+    // Pipelines: the latest run of each lane and its recent completion rate.
+    const laneTile = (key, label, href) => {
+      const lane = lanes[key], run = latestInLane(lane), [text, tone] = run ? OUTCOME_TEXT[run.outcome] || ['未知', ''] : ['暂无运行', ''];
+      const rate = lane?.summary?.success_rate;
+      return { label, value: text, tone, href, sub: run ? `${shortDate(run.created_at)} ${esc(run.time)} · ${esc(run.workflow)}${run.pr ? ` · PR #${run.pr}` : ''}<br>近 ${L.window_days} 天成功率 ${pct(rate)}（${n(lane.summary.total)} 次）` : lane ? `近 ${L.window_days} 天没有运行` : '分层历史尚未生成' };
+    };
+    html += sectionHead('流水线', L ? `最近一次运行的结论；成功率 = 成功 ÷（成功 + 失败）` : '');
+    html += tiles([laneTile('pr', 'PR 门禁', '#ci'), laneTile('main', '主干', '#ci'), laneTile('daily', '每日构建', '#ci'), laneTile('release', '版本构建', '#releases')]);
+    if (L) html += `<div class="grid one" style="margin-top:12px">${card('近 14 天', ciLanes(recentLanes(L, Math.min(14, L.days.length)), { notes: false }), { sub: `每格一次运行，颜色为结论；<a href="#ci">完整 ${L.window_days} 天与 job 明细</a>` })}</div>`;
+
+    // Delivery and quality at a glance.
+    const layers = gate?.results ? Object.entries(gate.results).filter(([, r]) => r) : [];
+    const planned = layers.reduce((sum, [, r]) => sum + (r.planned || 0), 0), passed = layers.reduce((sum, [, r]) => sum + (r.passed || 0), 0);
+    // The published release list is canonical; the ops block adds the unreleased commit count.
+    const rel = releases[0] ? { tag: releases[0].tag, age_days: (Date.now() - new Date(releases[0].published_at).getTime()) / 86400000 } : ops?.releases?.latest;
+    html += sectionHead('交付与质量', '');
     html += tiles([
-      { label: 'Issue 开放', value: n(iss?.open_count), href: '#issues', sub: iss ? `7 天 +${n(iss.counts.opened_7d)} / −${n(iss.counts.closed_7d)} · 陈旧 ${n(iss.stale_count)}` : '—', tone: '' },
-      { label: 'PR 开放', value: n(prs?.open_count), href: '#prs', sub: prs ? `草稿 ${prs.draft_count} · 等待评审 ${prs.waiting_review_count} · CI 失败 ${prs.ci_states.failure || 0}` : '—', tone: prs && prs.waiting_review_count ? 'warn' : '' },
-      { label: `CI 主干成功率`, value: pct(mainRate), href: '#ci', sub: ci ? `连续失败 ${ci.red_streak_main} 次 · 7 天失败 ${ci.failures_7d}` : '—', tone: mainRate == null ? '' : mainRate >= 80 ? 'good' : mainRate >= 50 ? 'warn' : 'bad' },
-      { label: 'CI 最近执行用例', value: n(ut?.totals?.tests), href: '#tests', sub: ut?.totals ? `UT 通过 ${n(ut.totals.passed)} · 失败 ${n(ut.totals.failed)}${e2e?.totals ? ` · E2E ${e2e.totals.passed}/${e2e.totals.tests}` : ''}` : ut ? '产物存在但没有解析出用例数' : '无产物', tone: ut?.totals?.failed ? 'bad' : '' },
-      { label: '测试文件', value: n(tests?.tree?.total), href: '#tests', sub: tests?.tree ? Object.entries(tests.tree.by_layer).map(([k, v]) => `${k} ${v}`).join(' · ') : '—' },
-      { label: '整仓行覆盖率', value: cov?.value?.lines_pct != null ? pct(cov.value.lines_pct) : '无数据源', href: '#coverage', sub: cov?.source ? `${cov?.current?.kind === 'authoritative' ? '权威完整结果' : cov?.current?.kind === 'incremental' ? '增量估算' : '部分结果'} · ${Object.keys(cov.languages || {}).map((key) => key === 'node' ? 'Node.js' : 'Python').join(' + ') || '单一来源'}` : '已探测 Actions / Codecov / check-run，均未命中', tone: cov?.source ? (cov?.current?.kind === 'authoritative' ? 'good' : 'warn') : 'warn' },
-      { label: '最新 Release', value: rel ? esc(rel.tag) : '—', href: '#ops', sub: rel ? `${days(rel.age_days)}前 · 未发布提交 ${n(ops.releases.unreleased?.commits)}` : '无 release' },
-      { label: '社区健康度', value: ops?.community ? pct(ops.community.health_percentage) : '—', href: '#ops', sub: ops?.community ? `缺 ${ops.community.missing.join(', ') || '无'}` : '—' },
+      { label: '开放 PR', value: n(prs?.open_count), href: '#prs', tone: prs?.ci_states?.failure || prs?.waiting_review_count ? 'warn' : '', sub: prs ? `待评审超期 ${n(prs.waiting_review_count)} · 检查失败 ${n(prs.ci_states.failure || 0)} · 30 天合并 ${n(prs.merged_30d)}` : '—' },
+      { label: '开放 Issue', value: n(iss?.open_count), href: '#issues', sub: iss ? `7 天 +${n(iss.counts.opened_7d)} / −${n(iss.counts.closed_7d)} · 陈旧 ${n(iss.stale_count)}` : '—' },
+      { label: '主干门禁用例', value: layers.length ? `${n(passed)}<small>/ ${n(planned)}</small>` : '—', href: '#tests', tone: layers.length ? (passed === planned ? 'good' : 'bad') : '', sub: layers.length ? layers.map(([s, r]) => `${s.toUpperCase()} ${n(r.passed)}/${n(r.planned)}`).join(' · ') : '尚未读取到门禁计划' },
+      { label: '整仓行覆盖率', value: lines != null ? pct(lines) : '—', href: '#coverage', sub: cov?.current?.kind === 'authoritative' ? '主干完整结果' : cov?.current?.kind === 'incremental' ? '基线 + 主干增量' : cov?.source ? '部分结果' : '暂无覆盖率' },
+      { label: '最新版本', value: rel ? esc(rel.tag) : '—', href: '#releases', sub: rel ? `${days(rel.age_days)}前${ops?.releases?.unreleased ? ` · 之后 ${n(ops.releases.unreleased.commits)} 个提交未发布` : ''}` : '尚无 release' },
     ]);
 
-    // Attention list — computed from the same data the tabs show.
-    const items = [];
-    if (ci?.red_streak_main) items.push(['critical', `主干 CI 连续失败 ${ci.red_streak_main} 次；最近一次失败 job：${(ci.latest_main?.jobs || []).filter((j) => j.conclusion === 'failure').map((j) => `${j.name}${j.failed_steps.length ? `（步骤 ${j.failed_steps.join('、')}）` : ''}`).join('、') || '—'}`, '#ci']);
-    if (prs?.waiting_review_count) items.push(['warn', `${prs.waiting_review_count} 个 PR 超过 ${prs.review_sla_days} 天无人评审：${prs.items.filter((p) => p.waiting_review).map((p) => `#${p.number}`).join(' ')}`, '#prs']);
-    if (prs?.ci_states?.failure) items.push(['warn', `${prs.ci_states.failure} 个开放 PR 的 CI 为失败状态`, '#prs']);
-    if (prs?.items?.some((p) => p.mergeable === 'CONFLICTING')) items.push(['warn', `存在冲突的 PR：${prs.items.filter((p) => p.mergeable === 'CONFLICTING').map((p) => `#${p.number}`).join(' ')}`, '#prs']);
-    if (e2e?.totals?.failed) items.push(['warn', `最近 E2E 产物有 ${e2e.totals.failed} 个失败/超时用例（分支 ${e2e.branch}）`, '#tests']);
-    if (iss?.no_response_count) items.push(['info', `${iss.no_response_count} 个开放 Issue 还没有任何评论，${iss.unassigned_count} 个无人认领，${iss.unlabeled_count} 个无标签`, '#issues']);
-    if (iss?.stale_count) items.push(['info', `${iss.stale_count} 个 Issue 超过 ${iss.stale_days_threshold} 天没有更新`, '#issues']);
-    if (tests?.inventory?.some((p) => !p.tested)) items.push(['info', `没有任何测试文件的包：${tests.inventory.filter((p) => !p.tested).map((p) => p.package).join('、')}`, '#tests']);
-    if (cov && !cov.source) items.push(['info', '仓库没有可用的覆盖率数据源（无 coverage 产物 / Codecov / 覆盖率配置）', '#coverage']);
-    if (ops?.branches?.protection && !ops.branches.protection.enabled) items.push(['warn', `默认分支 ${ops.branches.default} 未启用分支保护（rulesets ${ops.branches.rulesets?.length || 0} 条）`, '#ops']);
-    if (ops?.branches?.stale?.length) items.push(['info', `陈旧分支：${ops.branches.stale.map((b) => `${b.name}（落后 ${n(b.behind)}）`).join('、')}`, '#ops']);
-    if (live(ops?.security) && !ops.security.dependabot?.ok) items.push(['info', `安全告警不可读：${ops.security.dependabot?.error?.hint || ''}`, '#ops']);
-    if (live(ops?.security)?.dependabot?.ok && ops.security.dependabot.open) items.push(['warn', `${ops.security.dependabot.open} 个开放的 Dependabot 告警`, '#ops']);
-    if (ops?.releases?.unreleased?.commits > 50) items.push(['info', `自 ${ops.releases.latest?.tag} 以来已有 ${n(ops.releases.unreleased.commits)} 个提交未发布`, '#ops']);
-    if (ops?.contributors?.bus_factor_50 === 1) items.push(['info', `贡献高度集中：一位贡献者贡献了 ${ops.contributors.top[0]?.share}% 的提交`, '#ops']);
-    if (!items.length) items.push(['info', '当前快照未发现告警；数据缺失的项目请查看对应页面', '#overview']);
-
-    const status = Object.entries(S).map(([k, s]) => badge(`${k} ${s.status}${s.elapsed_s ? ` · ${s.elapsed_s}s` : ''}`, s.status === 'ok' ? 'good' : s.status === 'partial' ? 'warn' : 'bad'));
-    html += `<div class="grid wide" style="margin-top:12px">${card('需要关注', `<ul class="attention">${items.map(([sev, text, href]) => `<li><span class="sev ${sev}"></span><span>${codeify(text)} <a href="${href}">查看</a></span></li>`).join('')}</ul>`)}
-      ${card('数据源状态', `<div class="status-row">${status.join('')}</div>${kv([
-        ['采集时间', `${date(snap.generated_at)}（${ago(snap.generated_at)}）`],
-        ['数据来源', link(snap.repo_url, esc(snap.repo))],
-        ['视图刷新', '每 60 秒读取已发布快照'],
-      ])}<div class="muted" style="margin-top:8px">各区块的错误与降级说明显示在对应标签页顶部。</div>`)}</div>`;
+    const releaseRows = releases.slice(0, 3).map((release) => {
+      const run = validation(release), e2eCounts = run && sumCounts((run.tests || []).filter((t) => t.layer === 'e2e'));
+      return `<li>${link(release.url, esc(release.tag))} <span class="muted">${ago(release.published_at)}</span> ${run ? `${conclusionBadge(run.status === 'completed' ? run.conclusion : run.status)} ${link(run.url, '验证运行')}${e2eCounts ? ` <span class="muted">E2E ${n(e2eCounts.passed)}/${n(e2eCounts.tests)}</span>` : ''}` : badge('无验证运行', 'warn')}</li>`;
+    }).join('');
+    const merged = (prs?.recent_merged || []).slice(0, 5).map((p) => `<li>${badge('合并', 'good')} ${link(p.url, `#${p.number} ${esc(p.title)}`)} <span class="muted">${ago(p.merged_at)}</span></li>`);
+    const opened = (iss?.items || []).slice().sort((a, b) => (b.created_at || '').localeCompare(a.created_at || '')).slice(0, 5).map((i) => `<li>${badge('新建', 'info')} ${link(i.url, `#${i.number} ${esc(i.title)}`)} <span class="muted">${ago(i.created_at)}</span></li>`);
+    html += `<div class="grid wide" style="margin-top:12px">
+      ${card('版本质量', releaseRows ? `<ul class="checks">${releaseRows}</ul>` : empty('仓库尚无 release'), { sub: '版本提交的验证运行结论；<a href="#releases">全部版本</a>' })}
+      ${card('最近动态', merged.length || opened.length ? `<ul class="checks">${[...merged, ...opened].join('')}</ul>` : empty('最近没有合并或新建'), { sub: '最近合并的 PR 与新建的 Issue' })}
+    </div>`;
+    const status = Object.entries(S).filter(([, s]) => s.status !== 'ok').map(([k, s]) => badge(`${k} ${s.status}`, s.status === 'partial' ? 'warn' : 'bad'));
+    html += `<p class="muted small" style="margin-top:12px">数据来源 ${link(snap.repo_url, esc(snap.repo))} · 视图每 60 秒读取已发布快照${status.length ? ` · 部分区块不完整：${status.join(' ')}` : ''}</p>`;
     return html;
+  }
+
+  function renderReleases(snap) {
+    const releases = snap.releases || [], runsById = new Map((snap.quality?.runs || []).map((r) => [r.id, r]));
+    const html = sectionHead('版本验证', '只关联提交与版本一致的验证运行；发布成功不等于测试完成');
+    if (!releases.length) return html + `<div class="card">${empty('仓库尚无 Release。发布版本后，将按标签对应的提交关联验证证据。')}</div>`;
+    return html + `<div class="card">${releases.map((release) => {
+      const runs = (release.validation_run_ids || []).map((id) => runsById.get(id)).filter(Boolean);
+      const evidence = runs.length ? runs.map((run) => {
+        const e2eCounts = sumCounts((run.tests || []).filter((t) => t.layer === 'e2e'));
+        return `<div class="release-evidence">${conclusionBadge(run.status === 'completed' ? run.conclusion : run.status)} ${link(run.url, esc(run.name))} <span class="muted">${e2eCounts ? `E2E ${n(e2eCounts.passed)} / ${n(e2eCounts.tests)} 通过` : '暂无 E2E 用例结果'}</span></div>`;
+      }).join('') : `${badge('尚无匹配的版本验证', 'warn')}<div class="muted small">等待此版本提交的验证运行。</div>`;
+      return `<div class="release-row"><div><h3>${link(release.url, esc(release.tag))}</h3>${badge(release.prerelease ? '预发布' : '已发布', release.prerelease ? 'warn' : 'good')} <span class="muted">${date(release.published_at)}</span> <code>${esc((release.sha || '提交未知').slice(0, 12))}</code></div><div>${evidence}</div></div>`;
+    }).join('')}</div>`;
   }
 
   function renderIssues(sec) {
@@ -215,9 +456,10 @@
     else if (f.issueLabel) rows = rows.filter((i) => i.labels.some((l) => l.name === f.issueLabel));
     if (f.issueAssignee === '__none__') rows = rows.filter((i) => !i.assignees.length);
     else if (f.issueAssignee) rows = rows.filter((i) => i.assignees.includes(f.issueAssignee));
-    if(d.preview_total>d.items.length)html += `<p>当前列表 ${d.items.length} / ${d.preview_total} · <a href="#history">查看全部历史</a></p>`;
-    html += sectionHead('开放 Issue', `${rows.length} / ${d.items.length}`);
-    html += `<div class="card"><div class="filters">
+    const preview = d.preview_total > d.items.length ? ` · 列表显示最近更新的 ${d.items.length} / ${d.preview_total} 个` : '';
+    html += listHead('issues', '开放 Issue', STATE.views.issues === 'board' ? `看板含最近关闭的 Issue${preview}` : `${rows.length} / ${d.items.length}${preview}`);
+    if (STATE.views.issues === 'board') return html + boardMount('issue');
+    html += `<div class="card work-table"><div class="filters">
       <input type="text" data-filter="issueQ" placeholder="搜索编号 / 标题 / 作者" value="${esc(f.issueQ)}">
       <select data-filter="issueLabel"><option value="">全部标签</option><option value="__none__" ${f.issueLabel === '__none__' ? 'selected' : ''}>无标签</option>${labels.map((l) => `<option ${f.issueLabel === l ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
       <select data-filter="issueAssignee"><option value="">全部认领人</option><option value="__none__" ${f.issueAssignee === '__none__' ? 'selected' : ''}>无人认领</option>${assignees.map((a) => `<option ${f.issueAssignee === a ? 'selected' : ''}>${esc(a)}</option>`).join('')}</select>
@@ -256,8 +498,15 @@
       const list = checks.length ? `<details><summary>${ok}/${checks.length} 通过${bad ? `，${bad} 失败` : ''}</summary><ul class="checks">${checks.map((c) => `<li>${conclusionBadge(c.conclusion)} ${c.url ? link(c.url, esc(c.name)) : esc(c.name)}</li>`).join('')}</ul></details>` : '';
       return `${state}${list}`;
     };
-    html += sectionHead('开放 PR');
-    html += `<div class="card">${table('pr-open', [
+    html += `<div class="grid">
+      ${card('评审负载', bars(d.reviewer_load.map((r) => ({ label: r.login, value: r.count })), { emptyText: '开放 PR 没有被指定或提交过评审' }), { sub: '被请求评审 + 已提交评审（开放 PR）' })}
+      ${card('PR 作者', bars(d.authors.map((a) => ({ label: a.login, value: a.count }))), { sub: '开放 + 最近关闭' })}
+      ${card('评审决定', bars(Object.entries(d.review_decisions).map(([k, v]) => ({ label: (DECISION[k] || [k])[0], value: v }))))}
+      ${card('CI 状态', bars(Object.entries(d.ci_states).map(([k, v]) => ({ label: CONCLUSION_NAME[k] || k, value: v }))))}
+    </div>`;
+    html += listHead('prs', '开放 PR', STATE.views.prs === 'board' ? '看板含最近关闭与合并的 PR' : `${d.items.length} 个`);
+    if (STATE.views.prs === 'board') html += boardMount('pr');
+    else html += `<div class="card work-table">${table('pr-open', [
       { key: 'number', label: '#', num: true, render: (p) => link(p.url, `#${p.number}`) },
       { key: 'title', label: '标题', render: (p) => `${link(p.url, esc(p.title))}<div class="sub">${esc(p.author)} · <code>${esc(p.head)}</code> → <code>${esc(p.base)}</code>${p.labels.length ? ' · ' + labelChips(p.labels) : ''}</div>` },
       { key: 'age_days', label: '年龄', num: true, render: (p) => days(p.age_days) },
@@ -266,12 +515,6 @@
       { key: 'requested_reviewers', label: '评审人', render: (p) => (p.requested_reviewers.length ? esc(p.requested_reviewers.join(', ')) : p.reviews.length ? esc([...new Set(p.reviews.map((r) => r.author))].join(', ')) : '<span class="muted">未指定</span>'), sort: (p) => p.requested_reviewers.length },
       { key: 'updated_at', label: '更新', render: (p) => ago(p.updated_at) },
     ], d.items, { emptyText: '当前没有开放 PR' })}</div>`;
-    html += `<div class="grid" style="margin-top:12px">
-      ${card('评审负载', bars(d.reviewer_load.map((r) => ({ label: r.login, value: r.count })), { emptyText: '开放 PR 没有被指定或提交过评审' }), { sub: '被请求评审 + 已提交评审（开放 PR）' })}
-      ${card('PR 作者', bars(d.authors.map((a) => ({ label: a.login, value: a.count }))), { sub: '开放 + 最近关闭' })}
-      ${card('评审决定', bars(Object.entries(d.review_decisions).map(([k, v]) => ({ label: (DECISION[k] || [k])[0], value: v }))))}
-      ${card('CI 状态', bars(Object.entries(d.ci_states).map(([k, v]) => ({ label: CONCLUSION_NAME[k] || k, value: v }))))}
-    </div>`;
     html += sectionHead('最近合并', '按合并时间');
     html += `<div class="card">${table('pr-merged', [
       { key: 'number', label: '#', num: true, render: (p) => link(p.url, `#${p.number}`) },
@@ -295,8 +538,12 @@
       { label: '主干中位耗时', value: dur(d.main.median_duration_s) },
       { label: '采样 run', value: n(d.runs_sampled), sub: `job 明细取最近 ${d.job_history_runs} 次主干 run` },
     ]);
+    const L = d.lanes;
+    const range = L ? `近 ${L.window_days} 天（${laneDay(L.days[0])}–${laneDay(L.days[L.days.length - 1])}，${esc(L.zone)}）` : '';
+    html += `<div class="grid one" style="margin-top:12px">
+      ${card('CI 分层历史', ciLanes(L), { sub: `${range} · 各层共用日期轴，每格一次 run，同一天自上而下按时间排列（上早下晚）· 点击打开 run` })}
+    </div>`;
     html += `<div class="grid wide" style="margin-top:12px">
-      ${card(`主干时间线`, strip(d.main_timeline) + legend([{ name: '成功', color: 'var(--good)' }, { name: '失败/超时', color: 'var(--critical)' }, { name: '取消', color: 'var(--axis)' }, { name: '运行中', color: 'var(--warning)' }]), { sub: `最近 ${d.main_timeline.length} 次，右侧最新，点击打开 run` })}
       ${card('最近一次主干 run', d.latest_main ? `${kv([
         ['Run', `${link(d.latest_main.run.url, esc(d.latest_main.run.title))} ${conclusionBadge(d.latest_main.run.conclusion)}`],
         ['时间', `${date(d.latest_main.run.created_at)} · ${dur(d.latest_main.run.duration_s)} · ${esc(d.latest_main.run.actor)}`],
@@ -336,6 +583,82 @@
     return html;
   }
 
+  // Source-tagged tests: the collector evaluates every CI profile on the latest
+  // default-branch catalog; this only lays the answer out.
+  const PROFILE_NAME = { pr: 'PR', daily: 'Daily', release: 'Release' };
+  const SLICE_NAME = { ut: 'UT', st: 'ST', e2e: 'E2E' };
+  const TAKE = { yes: ['✓', '选取'], any: ['不限', '不限制该维度'], no: ['✗', '不选'] };
+  const tagChip = (tag, muted) => `<span class="tag-chip${muted ? ' muted' : ''}">${esc(tag)}</span>`;
+  function taggedSection(t) {
+    let html = sectionHead('标签化测试', t ? `默认分支最新 CI 冻结的用例目录 · ${n(t.cases)} 个用例 · ${t.dimensions.length} 个标签维度 · ${n(t.signatures)} 种标签组合` : '');
+    if (!t) return html + `<div class="banner warn"><span class="icon">▲</span><div><div class="title">尚未读取到标签化测试目录</div><div>需要源仓 CI 在 ut / st / e2e-results 产物中上传各层的 <code>tagged/catalog.json</code> 与 <code>plan.json</code>；读取到默认分支的一次运行后，这里显示各维度标签、PR / Daily / Release 的组合与覆盖情况。</div></div></div>`;
+    const share = (x) => (t.cases ? `${((x / t.cases) * 100).toFixed(1)}%` : '—');
+    const runText = (p) => {
+      if (!p.run) return '暂无该组合的运行';
+      const parts = Object.entries(p.results || {}).filter(([, r]) => r).map(([s, r]) => `${SLICE_NAME[s] || s} ${n(r.passed)}/${n(r.planned)}`);
+      return `最近运行 ${shortDate(p.run.created_at)}${parts.length ? ` · 通过 ${parts.join(' · ')}` : ''}`;
+    };
+    const catalogRun = t.catalog.run;
+    const notes = [];
+    if (t.catalog.missing.length) notes.push(`目录缺少 ${t.catalog.missing.map((s) => SLICE_NAME[s] || s).join('、')} 层（该层产物未读取到），这些用例不在统计内。`);
+    if (!t.schema.known) notes.push('未读取到标签词表：未声明的维度没有补默认值，词表外的标签值也无法列出。');
+    const drift = t.checks.filter((c) => c.computed !== c.planned);
+    if (drift.length) notes.push(`看板按规则计算的选中数与 CI 冻结计划不一致（${drift.map((c) => `${SLICE_NAME[c.slice] || c.slice}：计划 ${n(c.planned)}，计算 ${c.computed == null ? '无法解析' : n(c.computed)}`).join('；')}），覆盖数字仅供参考。`);
+    t.profiles.filter((p) => p.run && p.revisions?.length && t.catalog.revision.length && p.revisions.join() !== t.catalog.revision.join()).forEach((p) => notes.push(`${PROFILE_NAME[p.name]} 的规则取自修订 ${p.revisions.map((r) => r.slice(0, 7)).join('/')}，目录为 ${t.catalog.revision.map((r) => r.slice(0, 7)).join('/')}；覆盖按同一目录计算。`));
+    html += `<div class="muted" style="margin:-4px 0 8px">目录来自 ${link(catalogRun.url, `run ${esc(catalogRun.id)}`)}（${esc(catalogRun.branch)} · ${esc(catalogRun.event)} · ${ago(catalogRun.created_at)} · 修订 <code>${esc(t.catalog.revision.map((r) => r.slice(0, 7)).join('/'))}</code>）；各组合的规则取自其最近一次默认分支 / 版本运行的冻结计划。</div>`;
+    html += tiles([
+      { label: '目录用例', value: n(t.cases), sub: `${t.catalog.slices.map((s) => SLICE_NAME[s] || s).join(' + ')} 三层合并去重` },
+      ...t.profiles.map((p) => ({ label: `${PROFILE_NAME[p.name]} 选中`, value: p.covered == null ? '—' : n(p.covered), sub: p.covered == null ? (p.error ? '规则无法解析' : '暂无运行，无法读取组合') : `${share(p.covered)} · ${esc(runText(p))}` })),
+      { label: '任一组合覆盖', value: share(t.covered), sub: `${n(t.covered)} / ${n(t.cases)} 个用例`, tone: 'good' },
+      { label: '从未覆盖', value: n(t.uncovered.cases), sub: '当前任何组合都不会选中', tone: t.uncovered.cases ? 'warn' : 'good' },
+    ]);
+    if (notes.length) html += `<ul class="notes">${notes.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`;
+
+    // Dimension × profile matrix: reading down a profile column gives its combination.
+    const profiles = t.profiles;
+    const head = profiles.map((p) => `<th class="take-col"><div>${esc(PROFILE_NAME[p.name])}</div><div class="sub">${p.same_as ? `与 ${esc(PROFILE_NAME[p.same_as])} 相同` : p.run ? (p.rules ? `${p.rules.length} 条规则` : '含 not，见选择器') : '暂无运行'}</div></th>`).join('');
+    const body = t.dimensions.map((dim) => {
+      const meta = [dim.multiple ? '可多选' : '单选', dim.vocabulary != null ? `词表 ${dim.vocabulary} 个` : '', `使用 ${dim.used} 个`, dim.default ? `默认 ${dim.default}` : ''].filter(Boolean).join(' · ');
+      const group = `<tr class="dim-row"><th colspan="${2 + profiles.length}"><b>${esc(dim.group)}</b> <span class="sub">${esc(meta)}</span></th></tr>`;
+      return group + dim.values.map((v) => {
+        const miss = v.cases - v.covered;
+        const bar = `<span class="tag-bar"${tip(`${dim.group}:${v.value}\n${n(v.cases)} 个用例 · 被任一组合选中 ${n(v.covered)} · 从未覆盖 ${n(miss)}`)}>${v.covered ? `<span class="hit" style="width:${(v.covered / t.cases) * 100}%"></span>` : ''}${miss ? `<span class="miss" style="width:${(miss / t.cases) * 100}%"></span>` : ''}</span>`;
+        const takes = profiles.map((p) => {
+          const state = v.profiles[p.name];
+          if (!p.run) return '<td class="take-col"></td>';
+          const [mark, text] = TAKE[state] || ['?', '规则无法展开'];
+          return `<td class="take-col"><span class="take ${esc(state || 'unknown')}"${tip(`${PROFILE_NAME[p.name]} ${text} ${dim.group}:${v.value}`)} aria-label="${esc(`${PROFILE_NAME[p.name]} ${text} ${dim.group}:${v.value}`)}">${mark}</span></td>`;
+        }).join('');
+        return `<tr class="${v.cases ? '' : 'unused'}" data-tag="${esc(`${dim.group}:${v.value}`)}"><td>${tagChip(v.value, !v.cases)}</td><td class="tag-count">${bar}<span class="num">${n(v.cases)}</span>${miss ? ` <span class="miss-text">未覆盖 ${n(miss)}</span>` : ''}</td>${takes}</tr>`;
+      }).join('');
+    }).join('');
+    const ruleText = (p) => {
+      if (!p.run) return `${PROFILE_NAME[p.name]}：暂无运行，无法读取组合`;
+      if (p.same_as) return `${PROFILE_NAME[p.name]}：与 ${PROFILE_NAME[p.same_as]} 规则相同`;
+      if (!p.rules) return `${PROFILE_NAME[p.name]}：${Object.values(p.selectors).join(' ｜ ')}`;
+      return `${PROFILE_NAME[p.name]}：${p.rules.map((row) => row.map(([g, vs]) => vs.length > 1 ? `${g} ∈ {${vs.join(', ')}}` : `${g} = ${vs[0]}`).join(' 且 ')).join('；或 ')}（目标 ${p.targets.join('、')}）`;
+    };
+    html += `<div class="grid one" style="margin-top:12px">${card('每个维度的标签与组合', `<ul class="rule-list">${profiles.map((p) => `<li>${esc(ruleText(p))}</li>`).join('')}</ul>
+      <div class="table-wrap"><table class="tag-matrix"><thead><tr><th>标签</th><th>用例数</th>${head}</tr></thead><tbody>${body}</tbody></table></div>
+      <div class="legend"><span><i style="background:var(--s1)"></i>被任一组合选中</span><span><i style="background:var(--warning)"></i>从未覆盖</span><span>✓ 组合选取该标签 · 不限 = 组合不约束该维度 · ✗ 不选</span></div>
+      <div class="muted" style="margin-top:6px">读法：同一维度内多个 ✓ 是“或”，不同维度之间是“且”。可多选维度（os、arch）上一个用例可带多个值，各值计数之和会大于用例总数；多平台用例只要有一个平台实例被选中即算覆盖。</div>`, { sub: '标签值计数按默认分支目录；组合列来自冻结计划' })}</div>`;
+
+    // Never covered: why, then which cases.
+    const reasons = t.uncovered.reasons;
+    const items = t.uncovered.items;
+    html += `<div class="grid wide" style="margin-top:12px">${card('从未覆盖的用例', reasons.length ? `${bars(reasons.map((r) => ({ label: r.reason, value: r.cases, color: 'var(--warning)' })))}
+      <details style="margin-top:8px"><summary>查看用例（${n(t.uncovered.cases)}${items.length < t.uncovered.cases ? `，列出前 ${items.length} 个` : ''}）</summary>${table('tag-uncovered', [
+        { key: 'reason', label: '被排除的标签', render: (r) => `<span class="nowrap">${esc(r.reason)}</span>` },
+        { key: 'id', label: '用例', render: (r) => `<span class="mono case-id" title="${esc(r.id)}">${esc(r.id)}</span>` },
+      ], items)}</details>` : empty('所有用例都至少被一个组合选中'), { sub: '按挡住它的标签归类：该标签值不在任何组合里' })}
+      ${card('标签组合', table('tag-combos', [
+        { key: 'cases', label: '用例', num: true },
+        { key: 'tags', label: '标签（灰色为默认值）', sortable: false, render: (c) => c.tags.map((tag) => { const [g, v] = tag.split(':'); const dim = t.dimensions.find((x) => x.group === g); return tagChip(tag, dim?.default === v); }).join(' ') },
+        ...profiles.map((p) => ({ key: p.name, label: PROFILE_NAME[p.name], sortable: false, render: (c) => c.profiles[p.name] == null ? '<span class="muted">—</span>' : c.profiles[p.name] ? '<span class="take yes">✓</span>' : '<span class="take no">✗</span>' })),
+      ], t.combinations, { limit: 40 }), { sub: '标签完全相同的用例被组合选中的方式也相同' })}</div>`;
+    return html;
+  }
+
   function renderTests(sec) {
     const d = sec?.data;
     let html = sectionState(sec, '测试');
@@ -343,14 +666,13 @@
     const tree = d.tree;
     const ut = d.executed.find((e) => e.artifact.startsWith('ut'));
     const e2e = d.executed.find((e) => e.layer === 'e2e');
-    const cov = d.coverage;
     html += tiles([
       { label: '测试文件（仓库树）', value: n(tree?.total), sub: tree ? `来源 ${esc(d.tree_source)}` : '文件树不可用' },
       { label: '有测试的包', value: tree ? `${d.inventory.filter((p) => p.tested).length}<small>/ ${d.inventory.length}</small>` : '—', tone: d.inventory.some((p) => !p.tested) ? 'warn' : 'good' },
       { label: 'CI 最近 UT 用例', value: n(ut?.totals?.tests), sub: ut?.totals ? `${ut.totals.passed} 通过 · ${ut.totals.failed} 失败 · ${ut.totals.skipped} 跳过` : ut ? '产物存在但没有解析出用例数' : '无产物', tone: ut?.totals?.failed ? 'bad' : ut?.totals ? 'good' : '' },
       { label: 'CI 最近 E2E 用例', value: n(e2e?.totals?.tests), sub: e2e?.totals ? `${e2e.totals.passed} 通过 · ${e2e.totals.failed} 失败/超时 · ${e2e.totals.skipped} 跳过 · ${e2e.totals.flaky} 重试通过` : e2e ? '产物存在但没有解析出用例数' : '无产物', tone: e2e?.totals?.failed ? 'bad' : e2e?.totals ? 'good' : '' },
-      { label: '行覆盖率', value: cov?.value?.lines_pct != null ? pct(cov.value.lines_pct) : '无数据源', tone: cov?.source ? 'good' : 'warn', sub: cov?.source ? esc(cov.source) : '见下方数据源探测与降级视图' },
     ]);
+    html += taggedSection(d.tagged);
 
     // Distribution ----------------------------------------------------------
     if (tree) {
@@ -362,66 +684,8 @@
       </div>`;
     }
 
-    // Executed ------------------------------------------------------------
-    html += sectionHead('CI 最近执行结果', `来自 Actions 产物 ${esc((snapConfig().artifact_names || []).join(', '))}`);
-    if (!d.executed.length) html += `<div class="banner warn"><span class="icon">▲</span><div><div class="title">没有可解析的测试产物</div><div>本次采集范围内没有可用的 ${esc((snapConfig().artifact_names || []).join('/'))}。</div></div></div>`;
-    const executedCards = d.executed.map((e) => {
-      const t = e.totals || {};
-      const head = kv([
-        ['层 / 状态', `${badge(e.layer, 'info')} ${badge(e.status === 'incomplete' ? '不完整' : e.status || '未知', e.status === 'passed' ? 'good' : e.status === 'failed' ? 'bad' : e.status === 'incomplete' ? 'warn' : '')}${e.note ? ` <span class="muted">${esc(e.note)}</span>` : ''}`],
-        ['来源', `${e.branch ? `<code>${esc(e.branch)}</code>` : ''} · run ${e.run_id ? link(`${STATE.snap.repo_url}/actions/runs/${e.run_id}`, e.run_id) : '—'} · ${ago(e.created_at)}`],
-        ['用例', `${n(t.tests)} ${e.detail?.unit || ''} · <span class="ok">${n(t.passed)} 通过</span> · <span class="${t.failed ? 'bad' : ''}">${n(t.failed)} 失败</span> · ${n(t.skipped)} 跳过 · ${n(t.flaky)} 重试通过 · attempt ${e.attempt} · ${esc((e.sha || '').slice(0,12))}`],
-      ]);
-      let body = '';
-      if (e.detail?.commands) {
-        body += `<details open><summary>按命令 / 层（${e.detail.commands.length}）</summary>${table(`t-cmd-${e.artifact}`, [
-          { key: 'label', label: '脚本', render: (c) => `<code>${esc(c.label)}</code><div class="sub mono">${esc(c.command)}</div>` },
-          { key: 'framework', label: '框架' },
-          { key: 'tests', label: '用例', num: true }, { key: 'passed', label: '通过', num: true },
-          { key: 'failed', label: '失败', num: true, render: (c) => (c.failed ? `<span class="bad">${c.failed}</span>` : '0') }, { key: 'skipped', label: '跳过', num: true },
-        ], e.detail.commands)}</details>`;
-        body += `<details><summary>按包（${e.detail.packages.length}）</summary>${table(`t-pkg-${e.artifact}`, [
-          { key: 'package', label: '包', render: (p) => `<code>${esc(p.package)}</code>` },
-          { key: 'tests', label: '用例', num: true }, { key: 'passed', label: '通过', num: true },
-          { key: 'failed', label: '失败', num: true, render: (p) => (p.failed ? `<span class="bad">${p.failed}</span>` : '0') }, { key: 'skipped', label: '跳过', num: true },
-        ], e.detail.packages, { defaultSort: { key: 'tests', dir: 'desc' } })}</details>`;
-      }
-      if (e.detail?.files) {
-        const st = e.detail.stats || {};
-        body += `<div class="muted" style="margin:6px 0">测试项目 ${esc((e.detail.projects || []).join(', ') || '未提供')} · 通过 ${n(st.expected)} · 失败 ${n(st.unexpected)} · 重试通过 ${n(st.flaky)}</div>`;
-        if (e.detail.failures.length) body += `<details open><summary class="bad">失败 / 超时用例（${e.detail.failures.length}）</summary><ul class="checks">${e.detail.failures.map((f) => `<li>${conclusionBadge(f.status === 'timedOut' ? 'timed_out' : 'failure')} <code>${esc(f.file)}</code> ${esc(f.title)}${f.error ? `<details><summary>错误</summary><pre class="mono" style="white-space:pre-wrap">${esc(f.error)}</pre></details>` : ''}</li>`).join('')}</ul></details>`;
-        body += `<details><summary>按测试文件（${e.detail.files.length}）</summary>${table(`t-e2e-${e.artifact}`, [
-          { key: 'file', label: '测试文件', render: (f) => `<code>${esc(f.file)}</code>` },
-          { key: 'specs', label: '用例', num: true }, { key: 'passed', label: '通过', num: true },
-          { key: 'failed', label: '失败', num: true, render: (f) => (f.failed + f.timedOut ? `<span class="bad">${f.failed + f.timedOut}</span>` : '0'), sort: (f) => f.failed + f.timedOut },
-          { key: 'skipped', label: '跳过', num: true }, { key: 'flaky', label: '重试通过', num: true },
-        ], e.detail.files)}</details>`;
-      }
-      if (e.detail?.outcomes) {
-        body += `<details open><summary>命令结果（${e.detail.outcomes.length}）</summary><ul class="checks">${e.detail.outcomes.map((o) => `<li>${conclusionBadge(o.exit_code === 0 ? 'success' : 'failure')} <code>${esc(o.command)}</code> <span class="muted">${dur(o.duration_ms == null ? null : o.duration_ms / 1000)}</span></li>`).join('')}</ul></details>`;
-      }
-      if (e.detail?.junit) body += `<details open><summary>JUnit suites</summary><ul class="checks">${e.detail.junit.map((j) => `<li><code>${esc(j.file)}</code> ${n(j.totals.tests)} 用例 · ${n(j.totals.failed)} 失败</li>`).join('')}</ul></details>`;
-      return { name: e.artifact, head, body };
-    });
-    // Summary cards side by side; drill-down tables get the full width below so commands are readable.
-    html += `<div class="grid wide">${executedCards.map((c) => card(c.name, c.head)).join('')}</div>`;
-    html += `<div class="grid one" style="margin-top:12px">${executedCards.filter((c) => c.body).map((c) => card(`${c.name} · 明细`, c.body)).join('')}</div>`;
-
-    // Coverage ------------------------------------------------------------
-    html += sectionHead('覆盖率', cov?.source ? `来源 ${esc(cov.source)}` : '报告覆盖率与测试文件分布分别展示');
-    const steps = `<ul class="steps">${(cov?.attempts || []).map((a) => `<li><span class="mark ${a.ok ? 'ok' : 'no'}">${a.ok ? '✓' : '✗'}</span><span><b>${esc(a.step)}</b> <span class="muted">${esc(a.detail)}</span></span></li>`).join('')}</ul>`;
-      const covLabels = {
-      lines_pct: '行覆盖率', branches_pct: '分支覆盖率', functions_pct: '函数覆盖率', statements_pct: '语句覆盖率',
-      lines_hit: '已覆盖行', lines_found: '总行数', branches_hit: '已覆盖分支', branches_found: '总分支数',
-      functions_hit: '已覆盖函数', functions_found: '总函数数', file: '文件', summary: '摘要', url: '链接',
-    };
-    const covValue = cov?.value ? kv(Object.entries(cov.value).filter(([k, v]) => k !== 'format' && v != null).map(([k, v]) => [
-      covLabels[k] || k,
-      typeof v === 'number' ? (k.endsWith('_pct') ? pct(v) : n(v)) : esc(String(v)),
-    ])) : '';
-      const gap = cov && !cov.source ? `<div class="banner warn" style="margin:10px 0 0"><span class="icon">▲</span><div><div class="title">该仓库目前没有任何行覆盖率数据源</div><div>最近的 Actions 产物中没有可解析的 lcov / coverage-summary，也未从 Codecov 或 check-run 找到覆盖率。下方用「结构代理」降级：每个包的源文件数、测试文件数、比值，以及 CI 最近一次实际执行的用例数。它衡量的是「有没有测、测了多少」，<b>不是</b>行覆盖率。</div><div class="hint">补齐方式：让 CI 上传名称含 <code>coverage</code>、<code>lcov</code> 或 <code>codecov</code> 的 Actions 产物，并在其中提供 <code>lcov.info</code>、<code>coverage-summary.json</code>、Cobertura 或 Clover XML；看板会自动识别。</div></div></div>` : '';
-    html += `<div class="card">${steps}${covValue}${gap}</div>`;
-    html += `<div class="card" style="margin-top:12px"><h3>按包的测试文件与 CI 用例<span class="sub">源文件数不含测试与 .d.ts；CI 用例只显示可映射到包的报告数量</span></h3>${table('t-inv', [
+    html += sectionHead('按包的测试结构', '源文件数不含测试与 .d.ts；CI 用例只显示可映射到包的报告数量；覆盖率见 Coverage 页');
+    html += `<div class="card">${table('t-inv', [
       { key: 'package', label: '包', render: (p) => `<code>${esc(p.package)}</code>` },
       { key: 'tested', label: '状态', render: (p) => (p.tested ? badge('有测试', 'good') : badge('无测试', 'bad')), sort: (p) => (p.tested ? 1 : 0) },
       { key: 'source_files', label: '源文件', num: true },
@@ -434,6 +698,46 @@
     return html;
   }
 
+  // Directory tree over per-file totals. Directories add up their files; a chain of
+  // single directories collapses into one row, like compact folders in an editor.
+  const coverageTone = (v) => (v == null ? '' : v >= 80 ? 'good' : v >= 50 ? 'warn' : 'bad');
+  function coverageTree(language, sources, query) {
+    const metrics = language === 'node' ? ['lines', 'branches', 'functions'] : ['lines', 'branches'];
+    const make = (name, path) => ({ name, path, dirs: new Map(), files: [], totals: {}, count: 0 });
+    const add = (node, totals) => {
+      node.count++;
+      for (const m of metrics) { const t = node.totals[m] ||= { covered: 0, total: 0 }; t.covered += totals?.[m]?.covered || 0; t.total += totals?.[m]?.total || 0; }
+    };
+    const root = make('', '');
+    for (const source of sources) {
+      if (query && !source.path.toLowerCase().includes(query)) continue;
+      const parts = source.path.split('/');
+      let node = root; add(root, source.totals);
+      parts.slice(0, -1).forEach((part, i) => {
+        if (!node.dirs.has(part)) node.dirs.set(part, make(part, parts.slice(0, i + 1).join('/')));
+        node = node.dirs.get(part); add(node, source.totals);
+      });
+      node.files.push({ name: parts[parts.length - 1], path: source.path, totals: source.totals });
+    }
+    if (!root.count) return empty(query ? '没有匹配的文件' : '没有文件');
+    const compact = (node) => { while (node.dirs.size === 1 && !node.files.length) { const [only] = node.dirs.values(); node = { ...only, name: `${node.name}/${only.name}` }; } return node; };
+    const percent = (t) => (t && t.total ? (t.covered * 100) / t.total : null);
+    const describe = (path, totals) => [path, ...metrics.map((m) => `${COVERAGE_METRIC[m]} ${n(totals?.[m]?.covered)} / ${n(totals?.[m]?.total)}（${pct(percent(totals?.[m]))}）`)].join('\n');
+    const cells = (totals, files) => metrics.map((m, i) => {
+      const v = percent(totals?.[m]);
+      return `<span class="cov-cell${i ? '' : ' main'}">${i ? '' : ratioBar(v ?? 0, coverageTone(v))}<span class="${coverageTone(v)}-text">${pct(v)}</span></span>`;
+    }).join('') + `<span class="cov-count">${n(totals?.lines?.covered)} / ${n(totals?.lines?.total)}${files == null ? '' : ` · ${n(files)} 个文件`}</span>`;
+    const row = (label, totals, files, path) => `<span class="cov-name"${tip(describe(path, totals))}>${label}</span>${cells(totals, files)}`;
+    const byName = (a, b) => a.name.localeCompare(b.name);
+    const branch = (node, depth) => [...node.dirs.values()].map(compact).sort(byName).map((dir) => {
+      const key = `${language}:${dir.path}`, open = query || STATE.covOpen.has(key);
+      return `<details class="cov-dir" data-cov-path="${esc(key)}"${open ? ' open' : ''} style="--depth:${depth}"><summary class="cov-row">${row(`<span class="cov-toggle" aria-hidden="true"></span>${esc(dir.name)}/`, dir.totals, dir.count, dir.path)}</summary>${branch(dir, depth + 1)}</details>`;
+    }).join('') + node.files.slice().sort(byName).map((file) => `<div class="cov-row cov-file" style="--depth:${depth}">${row(esc(file.name), file.totals, null, file.path)}</div>`).join('');
+    const head = `<div class="cov-row cov-head"><span class="cov-name">路径</span>${metrics.map((m) => `<span class="cov-cell">${COVERAGE_METRIC[m]}</span>`).join('')}<span class="cov-count">已覆盖 / 总行数</span></div>`;
+    return `<div class="cov-tree" data-language="${language}" style="--metrics:${metrics.length}">${head}${branch(root, 0)}</div>`;
+  }
+  const COVERAGE_METRIC = { lines: '行', branches: '分支', functions: '函数' };
+
   function renderCoverage(sec) {
     const d = sec?.data;
     let html = sectionState(sec, 'Coverage');
@@ -445,6 +749,12 @@
         + `<div class="banner warn"><span class="icon">▲</span><div><div class="title">等待 ScienceDiscovery 覆盖率工作流首次发布摘要</div><div>每日完整基线成功后，这里会显示整仓趋势和路径明细；PR 与 main 增量随后自动叠加。</div></div></div><div class="card" style="margin-top:12px">${steps}</div>`;
     }
     const languages = cov.languages || {};
+    const prs = STATE.snap.sections?.prs?.data || {};
+    const prTargetByNumber = new Map(
+      ['items', 'recent_merged', 'recent_closed_unmerged']
+        .flatMap((key) => prs[key] || [])
+        .map((row) => [Number(row.number), row.base]),
+    );
     if (!Object.keys(languages).length) {
       const labels = { lines_pct: '行覆盖率', branches_pct: '分支覆盖率', functions_pct: '函数覆盖率', statements_pct: '语句覆盖率' };
       const rows = Object.entries(cov.value || {}).filter(([key, value]) => key !== 'format' && value != null)
@@ -461,6 +771,16 @@
       { label: '数据集', value: Object.keys(languages).length, tone: Object.keys(languages).length === 2 ? 'good' : 'warn', sub: Object.keys(languages).map((key) => key === 'node' ? 'Node.js' : 'Python').join(' + ') },
     ]);
 
+    const selectedRange = coverageRange(languages);
+    if (selectedRange) {
+      html += `<div class="coverage-week-toolbar" aria-label="覆盖率趋势时间范围">
+        <button class="btn small" data-coverage-week="older"${STATE.coverageWeekOffset >= selectedRange.maxOffset ? ' disabled' : ''}>‹ 上一周</button>
+        <strong>${selectedRange.recent ? '最新 · ' : ''}${dayLabel(selectedRange.start)}–${dayLabel(selectedRange.end)}</strong>
+        <button class="btn small" data-coverage-week="newer"${STATE.coverageWeekOffset === 0 ? ' disabled' : ''}>下一周 ›</button>
+        <button class="btn small" data-coverage-week="latest"${STATE.coverageWeekOffset === 0 ? ' disabled' : ''}>最新</button>
+      </div>`;
+    }
+
     const query = (STATE.filters.coverageQ || '').trim().toLowerCase();
     const renderLanguage = (key, label) => {
       const dataset = languages[key];
@@ -475,7 +795,6 @@
         { label: `${label} 分支覆盖率`, value: pct(totals.branches?.percentage), sub: `${n(totals.branches?.covered)} / ${n(totals.branches?.total)}` },
       ];
       if (key === 'node') metricTiles.push({ label: `${label} 函数覆盖率`, value: pct(totals.functions?.percentage), sub: `${n(totals.functions?.covered)} / ${n(totals.functions?.total)}` });
-      metricTiles.push({ label: '口径', value: kind, tone, sub: baseline ? `${baseline.kind === 'nightly' ? 'nightly' : 'main 全量'} · ${ago(baseline.created_at)}` : '尚无完整基线' });
       let body = sectionHead(label, dataset.scope || dataset.source);
       if (current.kind !== 'authoritative') {
         body += `<div class="banner warn"><span class="icon">≈</span><div><div class="title">${esc(label)} 当前不是独立完整基线</div><div>${baseline ? `以 ${date(baseline.created_at)} 的完整结果为基线，叠加 ${(current.increments || []).length} 次 main 增量。` : '当前只拿到部分模块摘要；整仓结果会在完整运行后校准。'}</div></div></div>`;
@@ -483,7 +802,7 @@
       body += tiles(metricTiles);
       const history = (dataset.history || []).filter((row) => row.totals?.lines?.percentage != null);
       body += `<div class="grid wide" style="margin-top:12px">
-        ${card(`${label} 完整行覆盖率趋势`, history.length ? sparkline(history.map((row) => row.totals.lines.percentage), history.map((row) => date(row.created_at)), '%') + `<div class="muted">${history.map((row) => `${date(row.created_at)} ${pct(row.totals.lines.percentage)}`).join(' · ')}</div>` : empty('下一次完整运行后会形成趋势'), { sub: '只使用 authoritative/full 摘要，不混入 PR 增量' })}
+        ${card(`${label} 每日完整行覆盖率`, history.length ? coverageTrend(history, selectedRange?.start) : empty('下一次完整运行后会形成趋势'), { sub: '默认展示最新数据窗口；历史按自然周查看。每天取北京时间最后一个成功的 main push / nightly 完整结果；不混入 PR 结果' })}
         ${card(`${label} 数据身份`, kv([
           ['当前', `${badge(kind, tone)} ${esc(dataset.source)}`],
           ['完整基线', baseline ? `${date(baseline.created_at)} · <code>${esc((baseline.sha || '').slice(0, 12))}</code>` : '尚无'],
@@ -504,19 +823,25 @@
       ];
       if (key === 'node') columns.push({ key: 'functions_pct', label: '函数', num: true, render: (row) => pct(row.functions_pct) });
       columns.push({ key: 'files', label: '源文件', num: true });
-      body += sectionHead(`${label} 路径覆盖率`, '可按路径过滤');
-      body += `<div class="card"><label class="filter"><span>过滤路径</span><input type="search" data-filter="coverageQ" value="${esc(STATE.filters.coverageQ || '')}" placeholder="packages/schema 或 services/evolve"></label>${table(`cov-groups-${key}`, columns, groupRows, { defaultSort: { key: 'lines_pct', dir: 'asc' }, emptyText: '没有匹配的覆盖率路径' })}</div>`;
+      const sources = current.sources || [];
+      body += sectionHead(`${label} 目录覆盖率`, sources.length ? `${n(sources.length)} 个文件，逐层展开到文件；数据同上方“${kind}”` : '');
+      body += `<div class="card"><div class="cov-tools"><label class="filter"><span>过滤路径</span><input type="search" data-filter="coverageQ" value="${esc(STATE.filters.coverageQ || '')}" placeholder="packages/schema 或 services/evolve"></label>${sources.length ? `<span class="grow"></span><button class="btn small" data-cov-expand="${key}">全部展开</button><button class="btn small" data-cov-collapse="${key}">全部收起</button>` : ''}</div>
+        ${sources.length ? coverageTree(key, sources, query) : empty('当前覆盖率摘要没有逐文件数据；源仓覆盖率摘要带上文件列表（sources）后显示目录树。')}</div>`;
+      body += sectionHead(`${label} 路径覆盖率`, '按源仓的覆盖率分组；过滤条件同上');
+      body += `<div class="card">${table(`cov-groups-${key}`, columns, groupRows, { defaultSort: { key: 'lines_pct', dir: 'asc' }, emptyText: '没有匹配的覆盖率路径' })}</div>`;
       const prs = (dataset.pull_requests || []).map((row) => ({
         ...row,
+        base_branch: row.base_branch || prTargetByNumber.get(Number(row.number)),
         lines_pct: row.totals?.lines?.percentage,
         group_names: (row.groups || []).map((group) => group.name).join(', '),
       }));
-      body += sectionHead(`${label} 最近 PR 覆盖率`, '仅代表该 PR 选择到的模块，不是整仓覆盖率');
+      body += sectionHead(`${label} 最近 PR 覆盖率`, '该 PR 的 UT/ST 门禁实测范围；不会更新 main 当前覆盖率');
       body += `<div class="card">${table(`cov-prs-${key}`, [
         { key: 'number', label: 'PR', render: (row) => link(`${STATE.snap.repo_url}/pull/${row.number}`, `#${row.number}`) },
-        { key: 'branch', label: '分支', render: (row) => `<code>${esc(row.branch || '—')}</code>` },
-        { key: 'lines_pct', label: '受影响模块行覆盖率', num: true, render: (row) => pct(row.lines_pct) },
-        { key: 'group_names', label: '模块', render: (row) => `<span class="mono">${esc(row.group_names)}</span>` },
+        { key: 'branch', label: '来源分支', render: (row) => `<code>${esc(row.branch || '—')}</code>` },
+        { key: 'base_branch', label: '目标分支', render: (row) => `<code>${esc(row.base_branch || '—')}</code>` },
+        { key: 'lines_pct', label: '门禁实测行覆盖率', num: true, render: (row) => pct(row.lines_pct) },
+        { key: 'group_names', label: '覆盖路径', render: (row) => `<span class="mono">${esc(row.group_names)}</span>` },
         { key: 'created_at', label: '时间', render: (row) => ago(row.created_at) },
       ], prs, { limit: 10, emptyText: '还没有 PR 覆盖率摘要' })}</div>`;
       return body;
@@ -575,12 +900,10 @@
     return html;
   }
 
-  const snapConfig = () => STATE.snap?.config || {};
 
   // ------------------------------------------------------------ shell
   function renderShell() {
     const snap=STATE.snap, btn=$('#refresh-btn'), banner=$('#global-banner');
-    document.body.classList.toggle('board-page', STATE.tab === 'board');
     btn.disabled=!!STATE.status?.refreshing;
     btn.textContent=btn.disabled?'读取中…':'刷新视图';
     if(snap){
@@ -606,22 +929,24 @@
     const snap = STATE.snap;
     const render = (id, fn) => { const el = $(`#tab-${id}`); if (el) el.innerHTML = fn(); };
     if (!snap) {
-      ['overview', 'board', 'issues', 'prs', 'ci', 'tests', 'coverage', 'ops'].forEach((id) => render(id, () => `<div class="skeleton">${STATE.status?.refreshing ? '<span class="spinner"></span>采集中…' : '暂无数据'}</div>`));
+      ['overview', 'issues', 'prs', 'ci', 'tests', 'coverage', 'releases', 'ops'].forEach((id) => render(id, () => `<div class="skeleton">${STATE.status?.refreshing ? '<span class="spinner"></span>采集中…' : '暂无数据'}</div>`));
       return;
     }
     document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.id === `tab-${STATE.tab}`));
     // One tab's render bug must not blank the others: each tab is isolated and shows its own error.
     const safe = (id, fn) => { try { render(id, fn); } catch (err) { console.error(err); render(id, () => `<div class="banner error"><span class="icon">⛔</span><div><div class="title">该标签页渲染出错</div><div class="mono">${esc(err && err.stack ? err.stack.split('\n').slice(0, 2).join(' | ') : String(err))}</div><div class="hint">其他标签页不受影响；请把这行反馈给维护者。</div></div></div>`); } };
+    const keep = lanePositions();
     safe('overview', () => renderOverview(snap));
     safe('issues', () => renderIssues(snap.sections.issues));
     safe('prs', () => renderPRs(snap.sections.prs));
     safe('ci', () => renderCI(snap.sections.ci));
     safe('tests', () => renderTests(snap.sections.tests));
     safe('coverage', () => renderCoverage(snap.sections.tests));
+    safe('releases', () => renderReleases(snap));
     safe('ops', () => renderOps(snap.sections.ops));
-    window.GSBQuality?.render();
-    window.GSBHistory?.render();
+    pinLanes(keep);
     try { if (window.GSBBoard) window.GSBBoard.onSnapshot(snap); } catch (err) { console.error(err); }
+    mountBoard();
   }
 
   function renderAll() { renderShell(); renderTabs(); }
@@ -647,8 +972,6 @@
       const doc = await fetchJson('./data/snapshot.json?ts='+Date.now());
       if(!doc.sections || !doc.board)throw new Error('快照格式尚未更新，请稍后刷新');
       STATE.snap=doc;STATE.status={refreshing:false};
-      window.GSBQuality?.setSnapshot(doc);
-      window.GSBHistory?.setSnapshot(doc);
       window.GSBLocalBoard?.setSnapshot(doc);
       STATE.clientError = null;
     } catch (err) {
@@ -685,12 +1008,35 @@
   }
   // ------------------------------------------------------------ events
   document.addEventListener('click', (ev) => {
+    const coverageWeekButton = ev.target.closest('[data-coverage-week]');
+    if (coverageWeekButton && !coverageWeekButton.disabled) {
+      const direction = coverageWeekButton.dataset.coverageWeek;
+      if (direction === 'older') STATE.coverageWeekOffset += 1;
+      if (direction === 'newer') STATE.coverageWeekOffset = Math.max(0, STATE.coverageWeekOffset - 1);
+      if (direction === 'latest') STATE.coverageWeekOffset = 0;
+      renderTabs();
+      return;
+    }
     const th = ev.target.closest('th.sortable[data-table]');
     if (th) {
       const id = th.dataset.table, key = th.dataset.key;
       const cur = STATE.sort[id];
       STATE.sort[id] = cur && cur.key === key ? { key, dir: cur.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'desc' };
       renderTabs();
+      return;
+    }
+    const view = ev.target.closest('[data-work-view] button');
+    if (view) {
+      const tab = view.closest('[data-work-view]').dataset.workView;
+      STATE.views[tab] = view.dataset.val;
+      try { localStorage.setItem(VIEW_KEY, JSON.stringify(STATE.views)); } catch (e) { /* private mode */ }
+      renderTabs();
+      return;
+    }
+    const tree = ev.target.closest('[data-cov-expand], [data-cov-collapse]');
+    if (tree) {
+      const language = tree.dataset.covExpand || tree.dataset.covCollapse, open = !!tree.dataset.covExpand;
+      document.querySelectorAll(`.cov-tree[data-language="${language}"] .cov-dir`).forEach((dir) => { dir.open = open; });
       return;
     }
     const act = ev.target.closest('[data-action="refresh"]');
@@ -709,7 +1055,7 @@
   $('#refresh-btn').addEventListener('click', refresh);
   // Browsers throttle timers in background tabs; re-sync as soon as the tab is visible again.
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { clearTimeout(STATE.pollTimer); load(); } });
-  window.addEventListener('hashchange', () => { STATE.tab = location.hash.slice(1) || 'overview'; renderShell(); window.GSBHistory?.render(); document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.id === `tab-${STATE.tab}`)); });
+  window.addEventListener('hashchange', () => { STATE.tab = location.hash.slice(1) || 'overview'; renderShell(); mountBoard(); document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.id === `tab-${STATE.tab}`)); pinLanes(); });
   // Tooltip layer: any element with data-tip.
   const tipEl = $('#tooltip');
   document.addEventListener('mousemove', (ev) => {
@@ -721,6 +1067,28 @@
     const y = Math.min(ev.clientY + 14, window.innerHeight - tipEl.offsetHeight - 8);
     tipEl.style.left = `${x}px`; tipEl.style.top = `${y}px`;
   });
+  // Keyboard focus shows the same details beside the focused mark.
+  document.addEventListener('focusin', (ev) => {
+    const el = ev.target.closest?.('[data-tip]');
+    if (!el) return;
+    tipEl.textContent = el.dataset.tip;
+    tipEl.classList.remove('hidden');
+    const box = el.getBoundingClientRect();
+    tipEl.style.left = `${Math.max(8, Math.min(box.right + 8, window.innerWidth - tipEl.offsetWidth - 8))}px`;
+    tipEl.style.top = `${Math.max(8, Math.min(box.bottom + 6, window.innerHeight - tipEl.offsetHeight - 8))}px`;
+  });
+  document.addEventListener('focusout', () => tipEl.classList.add('hidden'));
+  document.addEventListener('scroll', (ev) => {
+    const el = ev.target;
+    if (el.classList?.contains('ci-lanes-scroll')) el.dataset.away = el.scrollLeft + el.clientWidth < el.scrollWidth - 2 ? '1' : '';
+  }, true);
+  window.addEventListener('resize', () => pinLanes());
+  // Remember expanded coverage directories across the periodic refresh.
+  document.addEventListener('toggle', (ev) => {
+    const dir = ev.target;
+    if (!dir.matches?.('.cov-dir')) return;
+    if (dir.open) STATE.covOpen.add(dir.dataset.covPath); else STATE.covOpen.delete(dir.dataset.covPath);
+  }, true);
 
   // Shared helpers for the board module (static/board.js).
   window.GSB = { esc, ago, days, date, n, badge, labelChips, link, codeify, conclusionBadge, tip, empty, kv, CONCLUSION_NAME, refresh, snapshot:()=>STATE.snap };
