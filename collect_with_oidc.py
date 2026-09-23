@@ -1,6 +1,7 @@
 """Collect with scoped App tokens exchanged for this Actions job's OIDC identity."""
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
 import json
 import os
@@ -67,6 +68,7 @@ def oidc_identity(audience):
 def main():
     grants = []
     stage = "configuration"
+    identity = None
     try:
         context = collection_context(os.environ["GITHUB_REPOSITORY"], os.environ.get("SOURCE_REPOSITORY", ""), os.environ.get("COLLECTION_REQUEST_ID", ""))
         url = os.environ["SDBOT_TOKEN_BROKER_URL"]
@@ -96,6 +98,17 @@ def main():
     except Exception as error:
         status = getattr(error, "status", None)
         detail = f" (HTTP {status})" if isinstance(status, int) else ""
+        if status == 403 and identity:
+            # Only public workflow identity fields; never print the JWT or its audience URL.
+            try:
+                encoded = identity.split(".")[1]
+                claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+                public = {name: str(claims.get(name, ""))[:300] for name in (
+                    "repository", "repository_id", "repository_owner_id", "ref", "ref_type",
+                    "workflow_ref", "job_workflow_ref", "sub", "event_name")}
+                print("OIDC workflow identity: " + json.dumps(public), flush=True)
+            except Exception:
+                pass
         print(f"::error::OIDC credential exchange failed at {stage}{detail}; check broker configuration and workflow identity.", flush=True)
         return 1
     finally:
