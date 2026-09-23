@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -35,6 +36,10 @@ def request_json(url, bearer, body=None, method="GET"):
             if len(raw) > 65536:
                 raise CredentialError("credential response too large")
             return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as error:
+        failure = CredentialError("credential request failed")
+        failure.status = error.code
+        raise failure from None
     except Exception:
         # Never include response bodies, headers or request URLs in runner logs.
         raise CredentialError("credential request failed") from None
@@ -61,6 +66,7 @@ def oidc_identity(audience):
 
 def main():
     grants = []
+    stage = "configuration"
     try:
         context = collection_context(os.environ["GITHUB_REPOSITORY"], os.environ.get("SOURCE_REPOSITORY", ""), os.environ.get("COLLECTION_REQUEST_ID", ""))
         url = os.environ["SDBOT_TOKEN_BROKER_URL"]
@@ -70,8 +76,10 @@ def main():
         audience = os.environ["SDBOT_TOKEN_AUDIENCE"]
         if not audience:
             raise CredentialError("missing token audience")
+        stage = "GitHub OIDC identity"
         identity = oidc_identity(audience)
         for purpose in ("source", "target"):
+            stage = purpose + " token exchange"
             grant = request_json(url, identity, {"purpose": purpose}, "POST")
             token = grant.get("token") if isinstance(grant, dict) else None
             if not isinstance(token, str) or not token or len(token) > 4096 or any(c.isspace() for c in token):
@@ -85,8 +93,10 @@ def main():
         child_env = {k: v for k, v in os.environ.items() if k not in {"ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "GH_TOKEN", "GITHUB_TOKEN", "GSB_PUBLISH_TOKEN"} and "PRIVATE_KEY" not in k}
         child_env.update(GITHUB_TOKEN=grants[0], GSB_PUBLISH_TOKEN=grants[1])
         return subprocess.run([sys.executable, str(ROOT / "publish.py"), "--repo", context["source"], "--publish-repo", context["target"], "--output", ".tmp/collected-site", "--incremental"], env=child_env, cwd=ROOT, check=False).returncode
-    except Exception:
-        print("::error::OIDC credential exchange failed; check broker configuration and workflow identity.", flush=True)
+    except Exception as error:
+        status = getattr(error, "status", None)
+        detail = f" (HTTP {status})" if isinstance(status, int) else ""
+        print(f"::error::OIDC credential exchange failed at {stage}{detail}; check broker configuration and workflow identity.", flush=True)
         return 1
     finally:
         for token in grants:
